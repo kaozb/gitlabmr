@@ -1,0 +1,198 @@
+"""LLM call + structured output contract.
+
+Reliability chain borrowed from PR-Agent:
+- model fallback list; parse/validation failures are treated as "this model
+  failed" and trigger the next model, not a task failure
+- finish_reason == "length" (truncated output) is an explicit failure
+- YAML extraction handles ``` fences and repairs two high-frequency breakages
+  before pydantic validates the final shape
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+
+import requests
+import yaml
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+logger = logging.getLogger("gitlabmr.llm")
+
+
+class LLMError(Exception):
+    """Raised for call errors, truncated output, or unparseable reviews."""
+
+    def __init__(self, reason: str, detail: str = ""):
+        super().__init__(f"{reason}: {detail}" if detail else reason)
+        self.reason = reason  # stable bucket, e.g. http_error / timeout / truncated / bad_yaml / bad_schema
+
+
+class KeyIssue(BaseModel):
+    relevant_file: str = Field(min_length=1)
+    issue_header: str = Field(default="Issue", min_length=1)
+    issue_content: str = Field(min_length=1)
+    start_line: int = Field(ge=1)
+    end_line: int = Field(ge=1)
+
+    @field_validator("relevant_file")
+    @classmethod
+    def _strip_path(cls, value: str) -> str:
+        return value.strip().lstrip("/")
+
+    @field_validator("end_line")
+    @classmethod
+    def _end_ge_start(cls, value: int, info):
+        start = info.data.get("start_line", value)
+        if value < start:
+            raise ValueError("end_line must be >= start_line")
+        return value
+
+
+class ReviewOutput(BaseModel):
+    overall_assessment: str = ""
+    score: int | None = Field(default=None, ge=0, le=100)
+    risk_level: str | None = None
+    key_issues_to_review: list[KeyIssue] = Field(default_factory=list)
+    relevant_tests: str | None = None
+    security_concerns: str | None = None
+
+    @field_validator("risk_level")
+    @classmethod
+    def _risk_literal(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        lowered = value.strip().lower()
+        return lowered if lowered in ("low", "medium", "high") else None
+
+    @field_validator("relevant_tests", mode="before")
+    @classmethod
+    def _tests_bool(cls, value):
+        if isinstance(value, bool):  # YAML 1.1 parses Yes/No as booleans
+            return "Yes" if value else "No"
+        return value
+
+    @field_validator("security_concerns", mode="before")
+    @classmethod
+    def _security_bool(cls, value):
+        if isinstance(value, bool):
+            return "No" if not value else "Yes"
+        return value
+
+    @field_validator("key_issues_to_review")
+    @classmethod
+    def _cap_issues(cls, value: list[KeyIssue], info):
+        cap = info.context.get("num_max_findings") if isinstance(info.context, dict) else None
+        if isinstance(cap, int) and cap > 0 and len(value) > cap:
+            return value[:cap]
+        return value
+
+
+_FENCE_RE = re.compile(r"```(?:ya?ml)?\s*\n(.*?)```", re.DOTALL)
+_BROKEN_VALUE_RE = re.compile(r"^(\s*-?\s*[\w.\[\]]+):(?!\S)(\s*)(.*:.*\S)?\s*$")
+
+
+def extract_yaml_block(text: str) -> str:
+    fence = _FENCE_RE.search(text)
+    return fence.group(1).strip() if fence else text.strip()
+
+
+def _repair_lines(raw: str) -> str:
+    """Repair the two YAML breakages models emit most:
+    unquoted scalar values containing ': ' and stray tabs in indentation."""
+    fixed = []
+    for line in raw.replace("\t", "  ").splitlines():
+        match = _BROKEN_VALUE_RE.match(line)
+        if match:
+            key, gap, value = match.groups()
+            if value:
+                line = f"{key}:{gap}\"{value.strip()}\""
+        fixed.append(line)
+    return "\n".join(fixed)
+
+
+def parse_review(text: str, num_max_findings: int = 6) -> ReviewOutput:
+    raw = extract_yaml_block(text)
+    data = None
+    for attempt in (raw, _repair_lines(raw)):
+        try:
+            data = yaml.safe_load(attempt)
+            break
+        except yaml.YAMLError:
+            continue
+    if not isinstance(data, dict):
+        raise LLMError("bad_yaml", "response is not a YAML mapping")
+    review = data.get("review", data)  # accept both nested and flat forms
+    if not isinstance(review, dict):
+        raise LLMError("bad_yaml", "missing 'review' mapping")
+    try:
+        return ReviewOutput.model_validate(review, context={"num_max_findings": num_max_findings})
+    except ValidationError as exc:
+        raise LLMError("bad_schema", exc.errors()[0].get("msg", "validation failed")) from exc
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    base_url: str
+    api_key: str
+    model: str
+    fallback_models: tuple[str, ...] = ()
+    timeout: int = 300
+    max_output_tokens: int = 4000
+    temperature: float = 0.2
+
+
+def chat(cfg: LLMConfig, system: str, user: str) -> tuple[str, str]:
+    """One chat completion. Returns (text, finish_reason); raises LLMError."""
+    url = f"{cfg.base_url.rstrip('/')}/chat/completions"
+    payload = {
+        "model": cfg.model,
+        "temperature": cfg.temperature,
+        "max_tokens": cfg.max_output_tokens,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    try:
+        resp = requests.post(
+            url,
+            json=payload,
+            headers={"Authorization": f"Bearer {cfg.api_key}"},
+            timeout=cfg.timeout,
+        )
+    except requests.RequestException as exc:
+        raise LLMError("timeout" if isinstance(exc, requests.Timeout) else "http_error", type(exc).__name__) from exc
+    if resp.status_code != 200:
+        raise LLMError("http_error", f"status {resp.status_code}")
+    try:
+        body = resp.json()
+        text = body["choices"][0]["message"]["content"] or ""
+        finish_reason = body["choices"][0].get("finish_reason") or ""
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise LLMError("bad_response", "malformed chat completion payload") from exc
+    if finish_reason == "length":
+        raise LLMError("truncated", "output cut by max_tokens")
+    return text, finish_reason
+
+
+def review_with_fallback(cfg: LLMConfig, system: str, user: str, num_max_findings: int = 6) -> tuple[ReviewOutput, str]:
+    """Try each model until one returns a valid structured review."""
+    errors: list[str] = []
+    for model in (cfg.model, *cfg.fallback_models):
+        attempt = LLMConfig(
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+            model=model,
+            timeout=cfg.timeout,
+            max_output_tokens=cfg.max_output_tokens,
+            temperature=cfg.temperature,
+        )
+        try:
+            text, _ = chat(attempt, system, user)
+            return parse_review(text, num_max_findings), model
+        except LLMError as exc:
+            errors.append(f"{model}: {exc}")
+            logger.warning("review attempt failed for model %s: %s", model, exc)
+    raise LLMError("all_models_failed", "; ".join(errors))

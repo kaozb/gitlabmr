@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.venv*/
+ENV/
+
+# Django
+*.sqlite3
+db.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+/staticfiles/
+/media/
+local_settings.py
+
+# 说明：reviewer/migrations/ 属于代码，必须提交，不在此忽略
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+repo_tokens*.yml
+tokens*.yml
+
+# 测试与覆盖率
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+nosetests.xml
+coverage.xml
+
+# 打包与构建产物
+build/
+dist/
+*.egg-info/
+.eggs/
+__pypackages__/
+pip-wheel-metadata/
+
+# 日志与运行时输出
+*.log
+*.log.*
+logs/
+tmp/
+*.pid
+*.swp
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.sublime-workspace
+.fleet/
+
+# 操作系统
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# 其他
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+*.bak
+*.orig
+*.tmp

@@ -1,0 +1,113 @@
+{% extends "reviewer/base.html" %}
+{% block content %}
+<h1>评审总览</h1>
+<p class="sub">MR 评审的实时状态、历史记录与手动触发入口。</p>
+
+<div class="grid cols-6">
+  <div class="stat"><div class="num">{{ stats.total }}</div><div class="label">累计评审</div></div>
+  <div class="stat ok"><div class="num">{{ stats.success }}</div><div class="label">成功</div></div>
+  <div class="stat err"><div class="num">{{ stats.failed }}</div><div class="label">失败</div></div>
+  <div class="stat info"><div class="num">{{ stats.running }}</div><div class="label">进行中</div></div>
+  <div class="stat idle"><div class="num">{{ stats.skipped }}</div><div class="label">跳过</div></div>
+  <div class="stat"><div class="num">{{ stats.events }}</div><div class="label">Webhook 事件</div></div>
+</div>
+
+<div class="card" style="margin-top:20px">
+  <div class="card-head"><h2>手动触发评审</h2></div>
+  <form method="post" action="{% url 'reviewer:review-trigger' %}" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
+    {% csrf_token %}
+    <div style="flex:2;min-width:220px">
+      <label style="margin-top:0">项目路径</label>
+      <input type="text" name="project" placeholder="例如 backend/payments" required>
+    </div>
+    <div style="flex:1;min-width:120px">
+      <label style="margin-top:0">MR IID</label>
+      <input type="number" name="mr_iid" placeholder="例如 42" required>
+    </div>
+    <button class="btn primary" type="submit">提交评审</button>
+  </form>
+  <p class="hint">等效于在 MR 中评论 /review；同一 head sha 已成功评审过则不会重复执行。</p>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>评审记录</h2>
+    <span class="muted">最近 50 条</span>
+  </div>
+  {% if reviews %}
+  <table>
+    <thead>
+      <tr><th>时间</th><th>项目 / MR</th><th>状态</th><th>评分</th><th>风险</th><th>问题</th>
+          <th>模型</th><th>耗时</th><th>来源</th><th>操作</th></tr>
+    </thead>
+    <tbody>
+      {% for r in reviews %}
+      <tr>
+        <td class="muted mono">{{ r.created_at|date:"m-d H:i" }}</td>
+        <td>
+          {% if r.mr_url %}<a href="{{ r.mr_url }}" target="_blank">{{ r.project_path }}!{{ r.mr_iid }}</a>
+          {% else %}{{ r.project_path }}!{{ r.mr_iid }}{% endif %}
+          <span class="muted mono" style="margin-left:6px">{{ r.head_sha|slice:":8" }}</span>
+        </td>
+        <td><span class="badge {{ r.status }}" {% if r.error_detail %}title="{{ r.error_detail }}"{% endif %}>{{ r.status }}</span></td>
+        <td>{% if r.score %}{{ r.score }}{% else %}—{% endif %}</td>
+        <td>{% if r.risk_level %}<span class="risk-{{ r.risk_level }}">{{ r.risk_level }}</span>{% else %}—{% endif %}</td>
+        <td>{{ r.issues_count }}</td>
+        <td class="mono">{{ r.model_used|default:"—" }}</td>
+        <td class="muted">{% if r.duration_ms %}{{ r.duration_ms }}ms{% else %}—{% endif %}</td>
+        <td class="muted">{{ r.source }}</td>
+        <td>
+          <a class="btn small" href="{% url 'reviewer:review-detail' r.pk %}">详情</a>
+          <form class="inline" method="post" action="{% url 'reviewer:review-retry' r.pk %}"
+                onsubmit="return confirm('强制重新评审 {{ r.project_path }}!{{ r.mr_iid }} ？')">
+            {% csrf_token %}<button class="btn small" type="submit">重新评审</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">暂无评审记录 —— 配置好仓库令牌后，MR 打开/推送或评论 /review 时会自动出现在这里。</div>
+  {% endif %}
+</div>
+
+<div class="grid cols-3">
+  <div class="card" style="grid-column:span 2">
+    <div class="card-head">
+      <h2>Webhook 事件</h2>
+      <span class="muted">最近 20 条</span>
+    </div>
+    {% if events %}
+    <table>
+      <thead><tr><th>时间</th><th>类型</th><th>项目</th><th>动作</th><th>处理</th><th>说明</th></tr></thead>
+      <tbody>
+        {% for e in events %}
+        <tr>
+          <td class="muted mono">{{ e.created_at|date:"m-d H:i:s" }}</td>
+          <td>{{ e.object_kind }}</td>
+          <td class="mono">{{ e.project_path|default:"—" }}</td>
+          <td>{{ e.action|default:"—" }}</td>
+          <td><span class="badge {% if e.handled == 'review' %}success{% elif e.handled == 'error' %}failed{% else %}skipped{% endif %}">{{ e.handled }}</span></td>
+          <td class="muted">{{ e.note|default:"—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}<div class="empty">尚未收到任何 Webhook 事件</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <h2>服务状态</h2>
+      <a class="btn small" href="{% url 'reviewer:settings' %}">去配置</a>
+    </div>
+    <dl class="kv">
+      {% for label, value, ok in summary %}
+      <dt>{{ label }}</dt>
+      <dd>{{ value }} {% if ok %}<span class="pill-yes">✓</span>{% else %}<span class="pill-no">✗</span>{% endif %}</dd>
+      {% endfor %}
+    </dl>
+  </div>
+</div>
+{% endblock %}

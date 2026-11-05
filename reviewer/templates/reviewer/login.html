@@ -1,0 +1,18 @@
+{% extends "reviewer/base.html" %}
+{% block content %}
+<div class="login-wrap">
+  <div class="card">
+    <h1 style="text-align:center">GitLab MR AI 评审控制台</h1>
+    <p class="sub" style="text-align:center">请输入访问密码（环境变量 GITLABMR_UI_PASSWORD）</p>
+    <form method="post">
+      {% csrf_token %}
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>访问密码</label>
+      <input type="password" name="password" autofocus autocomplete="current-password" required>
+      <div style="margin-top:16px">
+        <button class="btn primary" type="submit" style="width:100%">登录</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

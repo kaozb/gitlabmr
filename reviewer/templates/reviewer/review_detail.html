@@ -1,0 +1,95 @@
+{% extends "reviewer/base.html" %}
+{% block title %}评审详情 · {{ record.project_path }}!{{ record.mr_iid }}{% endblock %}
+{% block content %}
+<h1>{{ record.project_path }}!<span class="mono">{{ record.mr_iid }}</span></h1>
+<p class="sub">
+  <span class="badge {{ record.status }}">{{ record.status }}</span>
+  &nbsp;{% if record.mr_url %}<a href="{{ record.mr_url }}" target="_blank">在 GitLab 中打开 ↗</a>{% endif %}
+  &nbsp;<a href="{% url 'reviewer:dashboard' %}">← 返回总览</a>
+</p>
+
+<div class="card">
+  <div class="card-head">
+    <h2>评审结果</h2>
+    <form method="post" action="{% url 'reviewer:review-retry' record.pk %}">
+      {% csrf_token %}<button class="btn primary small" type="submit"
+      onclick="return confirm('强制重新评审该 MR？将忽略已有的评审记录。')">重新评审</button>
+    </form>
+  </div>
+  <dl class="kv">
+    <dt>head sha</dt><dd class="mono">{{ record.head_sha }}</dd>
+    <dt>评分 / 风险</dt>
+    <dd>{% if record.score %}{{ record.score }} 分{% else %}—{% endif %}
+        {% if record.risk_level %} · <span class="risk-{{ record.risk_level }}">{{ record.risk_level }}</span>{% endif %}</dd>
+    <dt>问题数</dt><dd>{{ record.issues_count }}</dd>
+    <dt>模型</dt><dd class="mono">{{ record.model_used|default:"—" }}</dd>
+    <dt>触发来源</dt><dd>{{ record.source }}</dd>
+    <dt>耗时</dt><dd>{% if record.duration_ms %}{{ record.duration_ms }} ms{% else %}—{% endif %}</dd>
+    <dt>diff / prompt / 输出</dt>
+    <dd>{{ record.diff_chars }} / {{ record.prompt_chars }} / {{ record.completion_chars }} 字符</dd>
+    <dt>创建 / 更新</dt><dd>{{ record.created_at|date:"Y-m-d H:i:s" }} → {{ record.updated_at|date:"Y-m-d H:i:s" }}</dd>
+    {% if record.error_reason %}
+    <dt>失败原因</dt><dd><span class="badge failed">{{ record.error_reason }}</span></dd>
+    {% endif %}
+    {% if record.error_detail %}
+    <dt>{% if record.status == "skipped" %}跳过原因{% elif record.status == "failed" %}失败详情{% else %}备注{% endif %}</dt>
+    <dd class="mono">{{ record.error_detail }}</dd>
+    {% endif %}
+  </dl>
+</div>
+
+<div class="card">
+  <div class="card-head">
+    <h2>评审流程</h2>
+    <span class="muted">点击任一步骤可展开该步骤的执行日志</span>
+  </div>
+  {% if record.steps %}
+  <div class="steps">
+    {% for s in record.steps %}
+      <div class="step {{ s.status }}" onclick="showStepDetail(this)"
+           data-detail="{{ s.detail|default:'（无日志）' }}">
+        <span class="step-dot">{% if s.status == "success" %}✓{% elif s.status == "failed" %}✕{% elif s.status == "running" %}⋯{% elif s.status == "skipped" %}—{% else %}·{% endif %}</span>
+        <span class="step-label">{{ s.label }}</span>
+        {% if s.ms %}<span class="step-ms">{{ s.ms }}ms</span>{% endif %}
+      </div>
+      {% if not forloop.last %}<div class="step-arrow">→</div>{% endif %}
+    {% endfor %}
+  </div>
+  <div id="step-detail" class="step-detail hidden"><pre id="step-detail-text"></pre></div>
+  {% else %}
+  <div class="empty">此记录没有流程数据（旧版本生成）</div>
+  {% endif %}
+</div>
+
+<script>
+  function showStepDetail(el) {
+    var box = document.getElementById("step-detail");
+    var text = document.getElementById("step-detail-text");
+    if (!box || !text) { return; }
+    if (el.classList.contains("active")) {  // second click collapses the log
+      el.classList.remove("active");
+      box.classList.add("hidden");
+      return;
+    }
+    document.querySelectorAll(".steps .step").forEach(function (s) { s.classList.remove("active"); });
+    el.classList.add("active");
+    text.textContent = el.querySelector(".step-label").textContent + "\n" + (el.getAttribute("data-detail") || "");
+    box.classList.remove("hidden");
+  }
+</script>
+
+<div class="grid cols-3">
+  <div class="card">
+    <div class="card-head"><h2>已评审文件</h2><span class="muted">{{ record.reviewed_files|length }}</span></div>
+    {% if record.reviewed_files %}
+      <ul style="margin:0;padding-left:18px;font-size:13px">{% for f in record.reviewed_files %}<li class="mono">{{ f }}</li>{% endfor %}</ul>
+    {% else %}<div class="empty">无</div>{% endif %}
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>未纳入评审</h2><span class="muted">{{ record.not_reviewed_files|length }}</span></div>
+    {% if record.not_reviewed_files %}
+      <ul style="margin:0;padding-left:18px;font-size:13px">{% for f in record.not_reviewed_files %}<li class="mono">{{ f }}</li>{% endfor %}</ul>
+    {% else %}<div class="empty">无（全部文件都已评审）</div>{% endif %}
+  </div>
+</div>
+{% endblock %}
