@@ -19,8 +19,9 @@ from ..conf import MAX_INLINE_COMMENTS, get_conf
 from ..models import ReviewRecord, try_register_review
 from .diffctx import DiffContext, build_diff_context, estimate_tokens
 from .gitlab import GitLabClient, GitLabError
-from .llm import KeyIssue, LLMConfig, LLMError, ReviewOutput, review_with_fallback
+from .llm import KeyIssue, LLMConfig, LLMError, ReviewOutput, filter_unverified_absence_issues, review_with_fallback
 from .prompts import build_system_prompt, build_user_prompt
+from .repoctx import build_repo_context
 from .render import (
     REVIEW_MARKER,
     render_failure,
@@ -196,9 +197,27 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             _skip_with_comment(client, project_path, mr_iid, tracker, record, "no reviewable files")
             _finish(record, tracker, "skipped", note_field="no reviewable files")
             return
-        tracker.done(
-            "fetch_diff", f"{len(diff_ctx.files)} 个文件纳入评审，约 {estimate_tokens(diff_ctx.diff_text)} tokens"
-        )
+        detail = f"{len(diff_ctx.files)} 个文件纳入评审，约 {estimate_tokens(diff_ctx.diff_text)} tokens"
+        repo_context = ""
+        if conf.context_enrichment:
+            # Layer-1 enrichment: full changed files + symbol reference search
+            # over the GitLab API; best-effort, failures degrade to diff-only.
+            repo_context, ctx_stats = build_repo_context(
+                client,
+                project_path,
+                head_sha,
+                diff_ctx,
+                max_files=conf.context_max_files,
+                per_file_chars=conf.context_max_file_chars,
+                max_symbols=conf.context_max_symbols,
+            )
+            if repo_context:
+                detail += f"；API 上下文增强：{len(ctx_stats['files'])} 个文件全文"
+                if ctx_stats["symbols"]:
+                    detail += f"，{len(ctx_stats['symbols'])} 个符号的引用搜索"
+                if not ctx_stats["search_available"]:
+                    detail += "（实例未启用高级搜索，跳过引用搜索）"
+        tracker.done("fetch_diff", detail)
         record.reviewed_files = diff_ctx.reviewed_files
         record.not_reviewed_files = diff_ctx.not_reviewed_files
         record.diff_chars = len(diff_ctx.diff_text)
@@ -217,6 +236,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             target_branch=mr.get("target_branch", ""),
             commit_messages=mr.get("merge_commit_message", "") or "",
             diff_ctx=diff_ctx,
+            repo_context=repo_context,
         )
         record.prompt_chars = len(system) + len(user)
         tracker.persist(record)
@@ -230,11 +250,23 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             max_output_tokens=conf.llm_max_output_tokens,
         )
         review, model_used = review_with_fallback(llm_cfg, system, user, conf.num_max_findings)
+        review, dropped_claims = filter_unverified_absence_issues(review)
+        if dropped_claims:
+            logger.info(
+                "dropped %d unverified absence claim(s) on %s!%s: %s",
+                len(dropped_claims),
+                project_path,
+                mr_iid,
+                ", ".join(i.issue_header for i in dropped_claims),
+            )
         record.model_used = model_used
         record.issues_count = len(review.key_issues_to_review)
         record.score = review.score
         record.risk_level = review.risk_level or ""
-        tracker.done("ai_review", f"模型 {model_used}，{len(review.key_issues_to_review)} 个问题")
+        ai_detail = f"模型 {model_used}，{len(review.key_issues_to_review)} 个问题"
+        if dropped_claims:
+            ai_detail += f"（已过滤 {len(dropped_claims)} 条无证据的缺失类断言）"
+        tracker.done("ai_review", ai_detail)
 
         # -- stage 5: publish
         tracker.start("publish")

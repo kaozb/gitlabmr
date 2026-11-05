@@ -98,6 +98,12 @@ class Conf:
     gitlab_timeout: int = 15
     llm_timeout: int = 300
     per_file_patch_chars: int = 60000
+    # Layer-1 context enrichment: fetch full changed files + blob-search the
+    # diff's symbols over the GitLab API (env-only knobs, no dashboard field).
+    context_enrichment: bool = True
+    context_max_files: int = 6
+    context_max_file_chars: int = 20000
+    context_max_symbols: int = 8
 
 
 def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
@@ -158,6 +164,10 @@ def _load_env_conf() -> Conf:
         gitlab_timeout=_env_int("GITLABMR_GITLAB_TIMEOUT", 15),
         llm_timeout=_env_int("GITLABMR_LLM_TIMEOUT", 300),
         per_file_patch_chars=_env_int("GITLABMR_PER_FILE_PATCH_CHARS", 60000),
+        context_enrichment=_env_bool("GITLABMR_CONTEXT_ENRICHMENT", True),
+        context_max_files=_env_int("GITLABMR_CONTEXT_MAX_FILES", 6),
+        context_max_file_chars=_env_int("GITLABMR_CONTEXT_MAX_FILE_CHARS", 20000),
+        context_max_symbols=_env_int("GITLABMR_CONTEXT_MAX_SYMBOLS", 8),
     )
 
 

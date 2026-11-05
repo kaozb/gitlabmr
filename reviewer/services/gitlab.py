@@ -4,6 +4,8 @@ Endpoints used:
 - GET  /user                                    identify the bot account
 - GET  /projects/:id/merge_requests/:iid        MR metadata + diff_refs
 - GET  /projects/:id/merge_requests/:iid/changes  file diffs
+- GET  /projects/:id/repository/files/:path/raw   full file content at a ref
+- GET  /projects/:id/search?scope=blobs           repo-wide code search
 - GET/POST/PUT/DELETE /projects/:id/merge_requests/:iid/notes[/:id]
 - GET/POST /projects/:id/merge_requests/:iid/discussions
 """
@@ -79,6 +81,35 @@ class GitLabClient:
             f"/projects/{self._project_ref(project)}/merge_requests/{mr_iid}/changes",
             params={"access_raw_diffs": "true"},
         ).json()
+
+    # -- repository reads (context enrichment) --------------------------------
+
+    def get_file_content(self, project: str | int, file_path: str, ref: str) -> str:
+        """Raw content of one file at ``ref``; a missing file raises GitLabError."""
+        encoded = quote(file_path, safe="")
+        return self._request(
+            "GET",
+            f"/projects/{self._project_ref(project)}/repository/files/{encoded}/raw",
+            params={"ref": ref},
+        ).text
+
+    def search_blobs(self, project: str | int, query: str, ref: str) -> list | None:
+        """Repo-wide blob search at ``ref``; None when advanced search is unavailable.
+
+        Self-managed GitLab returns 400 when advanced search is not enabled
+        (403 on license problems) - callers should treat None as "search
+        disabled" and continue with what they already have.
+        """
+        try:
+            return self._request(
+                "GET",
+                f"/projects/{self._project_ref(project)}/search",
+                params={"scope": "blobs", "search": query, "ref": ref, "per_page": 20},
+            ).json()
+        except GitLabError as exc:
+            if exc.status in (400, 403, 404, 422):
+                return None
+            raise
 
     # -- notes (MR comments) -------------------------------------------------
 
