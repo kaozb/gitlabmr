@@ -16,17 +16,14 @@
   <div class="card-head"><h2>手动触发评审</h2></div>
   <form method="post" action="{% url 'reviewer:review-trigger' %}" style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end">
     {% csrf_token %}
-    <div style="flex:2;min-width:220px">
-      <label style="margin-top:0">项目路径</label>
-      <input type="text" name="project" placeholder="例如 backend/payments" required>
-    </div>
-    <div style="flex:1;min-width:120px">
-      <label style="margin-top:0">MR IID</label>
-      <input type="number" name="mr_iid" placeholder="例如 42" required>
+    <div style="flex:1;min-width:320px">
+      <label style="margin-top:0">MR 链接</label>
+      <input type="text" name="mr_ref" autofocus required
+             placeholder="粘贴 MR 链接，例如 https://gitlab.example.com/group/repo/-/merge_requests/42">
     </div>
     <button class="btn primary" type="submit">提交评审</button>
   </form>
-  <p class="hint">等效于在 MR 中评论 /review；同一 head sha 已成功评审过则不会重复执行。</p>
+  <p class="hint">直接从浏览器地址栏复制 MR 链接粘上即可（<span class="mono">group/repo!42</span> 这种写法也认）；等效于在 MR 中评论 /review。同一 head sha 已成功评审过则不会重复执行。</p>
 </div>
 
 <div class="card">

@@ -97,6 +97,7 @@ class Setting(models.Model):
     per_file_patch_chars = models.IntegerField(null=True, blank=True)
     max_comment_chars = models.IntegerField(null=True, blank=True)
     inline_comments = models.BooleanField(null=True, blank=True)
+    inline_max_comments = models.IntegerField(null=True, blank=True)
     review_on_push = models.BooleanField(null=True, blank=True)
     ignore_branches = models.CharField(max_length=256, blank=True, default="")
     language = models.CharField(max_length=16, blank=True, default="")

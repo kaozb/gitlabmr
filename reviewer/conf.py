@@ -23,6 +23,12 @@ logger = logging.getLogger("gitlabmr.conf")
 # edits propagate without restarts while keeping config reads cheap.
 CONF_TTL_SECONDS = 10
 
+# Hard ceilings enforced in code, so no env var / dashboard value (/ broken
+# model reply) can turn a review into a comment flood. Raise them here, not in
+# the UI.
+MAX_INLINE_COMMENTS = 10
+MAX_FINDINGS = 20
+
 
 def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
@@ -44,6 +50,16 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_list(name: str) -> list[str]:
     return [item.strip() for item in _env(name).split(",") if item.strip()]
+
+
+def normalize_prefix(value: str) -> str:
+    """Canonical form of a repo prefix / project path.
+
+    Trimmed, no leading or trailing slashes, lower-case - so ``tp``, ``tp/`` and
+    ``TP`` are the same prefix, and a ``TP/CNEOSv2/...`` project path stays
+    comparable with any casing written in the config.
+    """
+    return str(value or "").strip().strip("/").lower()
 
 
 @dataclass(frozen=True)
@@ -72,6 +88,7 @@ class Conf:
     num_max_findings: int = 6
     llm_max_output_tokens: int = 4000
     inline_comments: bool = False
+    inline_max_comments: int = MAX_INLINE_COMMENTS  # 0 = summary comment only
     review_on_push: bool = True
     ignore_branches: tuple[str, ...] = ()
     bot_indicators: tuple[str, ...] = ("bot",)
@@ -88,13 +105,13 @@ def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-        prefix = str(entry.get("prefix", "")).strip()
+        prefix = normalize_prefix(entry.get("prefix", ""))
         token = str(entry.get("token", "")).strip()
         if not prefix or not token:
             continue
         tokens.append(
             RepoToken(
-                prefix=prefix.rstrip("/").lower(),
+                prefix=prefix,
                 api_url=str(entry.get("api_url", "")).strip().rstrip("/"),
                 token=token,
                 webhook_secret=(str(entry["webhook_secret"]).strip() if entry.get("webhook_secret") else None),
@@ -131,6 +148,7 @@ def _load_env_conf() -> Conf:
         num_max_findings=_env_int("GITLABMR_NUM_MAX_FINDINGS", 6),
         llm_max_output_tokens=_env_int("GITLABMR_LLM_MAX_OUTPUT_TOKENS", 4000),
         inline_comments=_env_bool("GITLABMR_INLINE_COMMENTS", False),
+        inline_max_comments=_env_int("GITLABMR_INLINE_MAX_COMMENTS", MAX_INLINE_COMMENTS),
         review_on_push=_env_bool("GITLABMR_REVIEW_ON_PUSH", True),
         ignore_branches=tuple(_env_list("GITLABMR_IGNORE_BRANCHES")),
         bot_indicators=tuple(_env_list("GITLABMR_BOT_INDICATORS")) or ("bot",),
@@ -158,6 +176,7 @@ _INT_OVERRIDES = (
     "llm_max_output_tokens",
     "llm_timeout",
     "num_max_findings",
+    "inline_max_comments",
     "max_diff_tokens",
     "per_file_patch_chars",
     "max_comment_chars",
@@ -199,28 +218,43 @@ def _apply_db_overrides(conf: Conf) -> Conf:
                 updates[name] = value
 
     if token_entries:
-        updates["repo_tokens"] = tuple(
-            sorted(
-                (
-                    RepoToken(
-                        prefix=entry.prefix.strip("/").lower(),
-                        api_url=(entry.api_url or conf.default_api_url).rstrip("/"),
-                        token=entry.token,
-                        webhook_secret=entry.webhook_secret or None,
-                    )
-                    for entry in token_entries
-                ),
-                key=lambda t: len(t.prefix),
-                reverse=True,
+        db_tokens = []
+        for entry in token_entries:
+            prefix = normalize_prefix(entry.prefix)
+            if not prefix:  # a blank prefix would swallow every project path
+                logger.warning("skipping repo token entry %s: blank prefix", entry.pk)
+                continue
+            db_tokens.append(
+                RepoToken(
+                    prefix=prefix,
+                    api_url=(entry.api_url or conf.default_api_url).rstrip("/"),
+                    token=entry.token,
+                    webhook_secret=entry.webhook_secret or None,
+                )
             )
-        )
+        # Longest prefix first so resolution is a simple linear scan.
+        updates["repo_tokens"] = tuple(sorted(db_tokens, key=lambda t: len(t.prefix), reverse=True))
     if not updates:
         return conf
     return replace(conf, **updates)
 
 
+def _clamp_int(value, low: int, high: int, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(number, high))
+
+
 def load_conf() -> Conf:
-    return _apply_db_overrides(_load_env_conf())
+    """Env defaults + dashboard overrides, then clamped to the code ceilings."""
+    conf = _apply_db_overrides(_load_env_conf())
+    return replace(
+        conf,
+        num_max_findings=_clamp_int(conf.num_max_findings, 1, MAX_FINDINGS, 6),
+        inline_max_comments=_clamp_int(conf.inline_max_comments, 0, MAX_INLINE_COMMENTS, MAX_INLINE_COMMENTS),
+    )
 
 
 _CONF: Conf | None = None

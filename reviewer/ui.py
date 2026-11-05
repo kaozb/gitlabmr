@@ -14,6 +14,7 @@ from __future__ import annotations
 import hmac
 import os
 from functools import wraps
+from urllib.parse import urlparse
 
 from django.contrib import messages
 from django.db.models import Count
@@ -21,8 +22,9 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
-from .conf import get_conf, reload_conf
+from .conf import MAX_INLINE_COMMENTS, get_conf, normalize_prefix, reload_conf
 from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
+from .services.mrref import MRRefError, parse_mr_ref
 from .services.pipeline import submit_review
 from .services.tokens import resolve_repo_token
 
@@ -32,6 +34,7 @@ INT_FIELDS = (
     "llm_max_output_tokens",
     "llm_timeout",
     "num_max_findings",
+    "inline_max_comments",
     "max_diff_tokens",
     "per_file_patch_chars",
     "max_comment_chars",
@@ -49,6 +52,8 @@ LLM_SETTING_GROUPS = [
     )),
     ("评审行为", "diff 预算、回写与触发策略", (
         ("num_max_findings", "最多问题数", "number", "每次评审最多报告的关键问题数"),
+        ("inline_max_comments", "行内评论上限", "number",
+         f"最多发几条行内评论，其余留在总结评论；代码硬上限 {MAX_INLINE_COMMENTS}（0 = 全部进总结）"),
         ("max_diff_tokens", "diff 预算（tokens）", "number", "超出预算时按文件裁剪"),
         ("per_file_patch_chars", "单文件 patch 上限（字符）", "number", ""),
         ("max_comment_chars", "评论长度上限（字符）", "number", "超出截断并保留隐藏标记"),
@@ -172,19 +177,52 @@ def dashboard(request):
     )
 
 
+def _api_host(api_url: str) -> str:
+    """Hostname of a configured GitLab address (``""`` when it is unusable)."""
+    value = (api_url or "").strip()
+    if not value:
+        return ""
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    return (parsed.hostname or "").lower()
+
+
 @ui_login_required
 @require_POST
 def trigger_review(request):
-    project = (request.POST.get("project") or "").strip().strip("/").lower()
-    iid = (request.POST.get("mr_iid") or "").strip()
-    if not project or not iid.isdigit():
-        messages.error(request, "请填写完整的项目路径与 MR IID（IID 须为数字）")
+    """Queue a review from a pasted MR link (legacy ``project`` + ``mr_iid`` still accepted)."""
+    raw = (request.POST.get("mr_ref") or "").strip()
+    if not raw:  # backwards compatible with the old two-field form / scripts
+        project = (request.POST.get("project") or "").strip()
+        iid = (request.POST.get("mr_iid") or "").strip()
+        raw = f"{project}!{iid}" if project and iid else raw
+    try:
+        ref = parse_mr_ref(raw)
+    except MRRefError as exc:
+        messages.error(request, str(exc))
         return redirect("/")
-    if resolve_repo_token(get_conf(), project) is None:
-        messages.error(request, f"{project} 未匹配到任何令牌，请先在「仓库令牌」中添加")
+
+    conf = get_conf()
+    repo = resolve_repo_token(conf, ref.project_path)
+    if repo is None:
+        messages.error(
+            request,
+            f"{ref.project_path} 未匹配到任何令牌，请先在「仓库令牌」中添加能覆盖该路径的前缀（或默认令牌）",
+        )
         return redirect("/")
-    submit_review(project, int(iid), source="manual")
-    messages.success(request, f"已提交评审任务：{project}!{iid}，结果稍后显示在列表中")
+
+    # A link copied from another GitLab instance would silently send the review
+    # to the wrong host, so refuse it before spawning a doomed pipeline run.
+    api_host = _api_host(repo.api_url or conf.default_api_url)
+    if ref.host and api_host and ref.host != api_host:
+        messages.error(
+            request,
+            f"链接域名 {ref.host} 与令牌 {repo.prefix or '(默认)'} 的 GitLab 地址 "
+            f"{repo.api_url or conf.default_api_url} 不一致；请检查「仓库令牌」里的 api_url",
+        )
+        return redirect("/")
+
+    submit_review(ref.project_path, ref.iid, source="manual")
+    messages.success(request, f"已提交评审任务：{ref.short}，结果稍后显示在列表中")
     return redirect("/")
 
 
@@ -281,7 +319,7 @@ def settings_repos_view(request):
         if action == "save_repo":
             return _save_repo_token(request)
         if action == "delete_repo":
-            prefix = (request.POST.get("prefix") or "").strip().strip("/").lower()
+            prefix = normalize_prefix(request.POST.get("prefix"))
             deleted, _ = RepoTokenEntry.objects.filter(prefix=prefix).delete()
             reload_conf()
             if deleted:
@@ -294,8 +332,10 @@ def settings_repos_view(request):
         messages.success(request, "GitLab 连接设置已保存并立即生效")
         return redirect("reviewer:settings-repos")
 
-    edit_prefix = (request.GET.get("edit") or "").strip().strip("/").lower()
+    edit_prefix = normalize_prefix(request.GET.get("edit"))
     editing = RepoTokenEntry.objects.filter(prefix=edit_prefix).first() if edit_prefix else None
+    # the add/edit form stays collapsed until the user asks for it ("编辑" / "新增")
+    show_repo_form = editing is not None or request.GET.get("new") == "1"
     repo_entries = list(RepoTokenEntry.objects.all())
     for entry in repo_entries:
         entry.masked_token = mask_secret(entry.token)
@@ -309,30 +349,46 @@ def settings_repos_view(request):
             show_repos=True,
             repo_entries=repo_entries,
             editing=editing,
+            show_repo_form=show_repo_form,
             using_db_tokens=RepoTokenEntry.objects.filter(enabled=True).exists(),
         ),
     )
 
 
 def _save_repo_token(request):
-    prefix = (request.POST.get("prefix") or "").strip().strip("/").lower()
+    prefix = normalize_prefix(request.POST.get("prefix"))
     token = (request.POST.get("token") or "").strip()
+    # 编辑态带 entry_id：按主键定位，因此允许直接改前缀（重命名）
+    entry_id = (request.POST.get("entry_id") or "").strip()
+    entry = RepoTokenEntry.objects.filter(pk=int(entry_id)).first() if entry_id.isdigit() else None
+    if entry is None and prefix:
+        entry = RepoTokenEntry.objects.filter(prefix=prefix).first()
     if not prefix or " " in prefix:
         messages.error(request, "前缀不能为空且不能包含空格，例如 backend/team-a")
         return redirect("reviewer:settings-repos")
-    existing = RepoTokenEntry.objects.filter(prefix=prefix).first()
-    if existing is None and not token:
+    if entry is None and not token:
         messages.error(request, f"新配置 {prefix} 必须填写访问令牌")
         return redirect("reviewer:settings-repos")
-    defaults = {
+    if entry is not None and entry.prefix != prefix:
+        conflict = RepoTokenEntry.objects.filter(prefix=prefix).exclude(pk=entry.pk).exists()
+        if conflict:
+            messages.error(request, f"前缀 {prefix} 已被其他配置占用，请换一个")
+            return redirect("reviewer:settings-repos")
+    fields = {
         "api_url": (request.POST.get("api_url") or "").strip().rstrip("/"),
         "webhook_secret": (request.POST.get("webhook_secret") or "").strip(),
         "note": (request.POST.get("note") or "").strip(),
         "enabled": request.POST.get("enabled") == "on",
     }
-    if token:  # empty token on an existing entry = keep the stored one
-        defaults["token"] = token
-    RepoTokenEntry.objects.update_or_create(prefix=prefix, defaults=defaults)
+    if entry is None:
+        entry = RepoTokenEntry(prefix=prefix, token=token, **fields)
+    else:
+        entry.prefix = prefix
+        for name, value in fields.items():
+            setattr(entry, name, value)
+        if token:  # empty token on an existing entry = keep the stored one
+            entry.token = token
+    entry.save()
     reload_conf()
     messages.success(request, f"已保存令牌配置：{prefix}（长前缀优先，立即生效）")
     return redirect("reviewer:settings-repos")

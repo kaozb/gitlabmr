@@ -34,6 +34,7 @@
     .grid { display: grid; gap: 14px; }
     .grid.cols-6 { grid-template-columns: repeat(6, 1fr); }
     .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid .field > label:first-child { margin-top: 0; }
     .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
     .stat .num { font-size: 24px; font-weight: 700; }
     .stat .label { color: var(--muted); font-size: 12px; }
@@ -102,6 +103,7 @@
     .step-arrow { align-self: center; color: var(--muted); font-size: 15px; }
     .step-detail { margin-top: 12px; }
     .step-detail.hidden { display: none; }
+    @media (max-width: 1180px) { .grid.cols-3 { grid-template-columns: repeat(2, 1fr); } }
     @media (max-width: 900px) { .grid.cols-6 { grid-template-columns: repeat(3, 1fr); } .grid.cols-3 { grid-template-columns: 1fr; } }
   </style>
 </head>

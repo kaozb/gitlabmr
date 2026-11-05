@@ -94,7 +94,7 @@ repos:
     token: glpat-team-a
 ```
 
-- 解析规则：`path_with_namespace.startswith(prefix)` 取**最长**前缀；无命中用 `default`；连 default 都没有该仓库 → 事件记 `skipped(no_token)`，不报错。
+- 解析规则：把所有前缀当成一个集合逐个对 `path_with_namespace` 做**忽略大小写**的字符串前缀匹配（前缀与路径都会先归一化：去首尾空白与 `/`、转小写）；命中项里**前缀最长**者胜出，无命中用 `default`；连 default 都没有该仓库 → 事件记 `skipped(no_token)`，不报错。
 - 每次评审把解析结果作为参数显式传递（**不用全局可变状态**），天然实现并发仓库隔离（PR-Agent 用请求级 deepcopy 达成同样目的）。
 
 ### D2 Webhook 安全与幂等
@@ -118,14 +118,14 @@ repos:
 - 调用：`POST {base_url}/chat/completions`，`response` 里检查 `finish_reason`，`length`（截断）视为失败（R2-3 修订：截断的 YAML 必然解析失败，提前判失败省一次解析）。
 - 回退链：`GITLABMR_MODEL` + `GITLABMR_FALLBACK_MODELS`（逗号分隔）。触发回退：HTTP 4xx/5xx、超时、YAML 解析失败、Pydantic 校验失败、finish_reason=length。
 - 解析：剥 ```yaml 栅栏 → `yaml.safe_load` → 修复两类高频坏模式（key 带空格冒号、值内未转义冒号——由 `keys_fix` 正则处理，参考 PR-Agent `load_yaml`）→ Pydantic `ReviewOutput` 强校验（issue 必含 file/header/content/start_line/end_line，start≤end>0）。
-- 位置校验（行内评论前）：文件必须在本次 changes 中、`end_line ≤ 新文件行数`（按 patch 行数上限校验，避免额外拉全文，R3-2 修订：用 patch 中该文件最大新行号校验而非拉取全文，省 API 调用）。
+- 位置校验（行内评论前）：文件必须在本次 changes 中、`start_line` 必须落在该文件 patch 里真实存在的 hunk 新行号上（R3-2 修订：用 patch 解析出的新行号集合校验，只需一次 hunk 行号化，无需拉全文；hunk 之间的空档行也会被拒，避免 GitLab position 400）。
 
 ### D5 结果回写
 
 | 项 | 方案 |
 |---|---|
 | 总结评论 | 评论体尾部带隐藏标记 `<!-- gitlabmr:review -->`；发布前 `GET notes` 找带标记且作者=bot 自身的评论 → `PUT` 原位更新；找不到 → `POST` 新建。作者校验失败 → 另发独立评论（绝不覆盖人类评论，R2-6 修订：明确"标记匹配"与"作者匹配"都通过才更新） |
-| 行内评论（`GITLABMR_INLINE_COMMENTS=true`） | `POST discussions`，`position`: 三 sha 取自 `mr.diff_refs`，`position_type=text`，`new_line` **0-based**；同一文件+行已有 bot 同指纹评论则跳过（去重指纹 `sha1(file+line+header)`）；发布失败回落到总结评论，不丢发现 |
+| 行内评论（`GITLABMR_INLINE_COMMENTS=true`） | `POST discussions`，`position`: 三 sha 取自 `mr.diff_refs`，`position_type=text`，`new_line` **0-based**；**只对本次 diff 中真实存在的文件与行发起**（文件必须纳入评审、行号必须是该文件 patch 中存在的 hunk 新行号，被过滤/二进制/超预算未送模型的文件一律不发行内）；同一文件+行已有 bot 评论则跳过；发布失败或被上述校验拒绝 → 回落到总结评论，不丢发现；**条数受 `inline_max_comments` 限制且被代码常量 `MAX_INLINE_COMMENTS=10` 硬封顶**，超出的问题留在总结评论；**顺序由 prompt 约定**（软要求，不做事后重排）：问题按复杂度降序（崩溃/数据损坏/安全 > 逻辑错误 > 性能 > 可维护性，再看影响面与触发难度），复杂度相同时 `issue_content` 更长更详细者在前——预算按列表顺序消费，越复杂的问题越先拿到行内名额 |
 | 占位评论 | 开始发 `Reviewing MR...`（notes.create 记 id），结束删除；失败也删除（R2-7 修订：finally 保证） |
 | 失败回写 | 评审异常 → 发布脱敏失败评论（错误按白名单映射为固定文案：超时/限流/认证/解析失败/未知），绝不上抛异常细节 |
 | 评论长度 | `GITLABMR_MAX_COMMENT_CHARS`（默认 60000）截断 |
@@ -154,8 +154,9 @@ repos:
 | `GITLABMR_MODEL` | `deepseek-chat` | 主模型 |
 | `GITLABMR_FALLBACK_MODELS` | 空 | 回退模型逗号分隔 |
 | `GITLABMR_MAX_DIFF_TOKENS` | `24000` | diff 预算（估算 token） |
-| `GITLABMR_NUM_MAX_FINDINGS` | `6` | 最多报几个问题 |
+| `GITLABMR_NUM_MAX_FINDINGS` | `6` | 最多报几个问题（代码内硬上限 20） |
 | `GITLABMR_INLINE_COMMENTS` | `false` | 是否发行内评论 |
+| `GITLABMR_INLINE_MAX_COMMENTS` | `10` | 行内评论条数上限（0 = 全部进总结；代码内硬上限 10，配置不能突破） |
 | `GITLABMR_REVIEW_ON_PUSH` | `true` | push 新提交是否重评 |
 | `GITLABMR_IGNORE_BRANCHES` | 空 | 忽略的目标分支逗号分隔 |
 | `GITLABMR_BOT_INDICATORS` | `bot` | 用户名含此词视为 bot |
@@ -166,7 +167,7 @@ repos:
 ## 6. 测试策略
 
 - `reviewer/tests.py`（Django TestCase，无网络依赖，全部 mock HTTP）：
-  - tokens：长前缀优先 / 默认兜底 / 无令牌 skip；
+  - tokens：长前缀优先（非段感知，`tp/cneos` 覆盖 `tp/CNEOSv2/...`）/ 前缀写法与大小写归一化（`tp` = `tp/` = `TP`）/ 默认兜底 / 无令牌 skip；
   - diffctx：hunk 行号化正确性、过滤、两级裁剪、清单生成；
   - llm：yaml 栅栏剥离、坏 key 修复、schema 校验失败触发回退、finish_reason=length 触发回退；
   - views：验签失败 403、bot/draft 过滤、幂等（同 sha 二次投递不重评）、投递成功 200；

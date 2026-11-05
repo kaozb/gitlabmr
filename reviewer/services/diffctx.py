@@ -12,6 +12,7 @@ from __future__ import annotations
 import fnmatch
 import re
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
@@ -34,15 +35,31 @@ def is_ignored(path: str, ignore_globs: tuple[str, ...] = DEFAULT_IGNORE_GLOBS) 
     return any(fnmatch.fnmatch(path, glob) or fnmatch.fnmatch(name, glob) for glob in ignore_globs)
 
 
-def number_patch_lines(patch: str) -> tuple[str, int]:
+class RenderedPatch(NamedTuple):
+    """Result of :func:`number_patch_lines`.
+
+    ``new_lines`` holds every new-file line number that actually appears in the
+    patch (added *and* context lines) - the only lines GitLab accepts as an
+    inline discussion position, and therefore the only lines we may comment on.
+    """
+
+    text: str
+    max_new_line: int
+    new_lines: frozenset[int]
+
+
+def number_patch_lines(patch: str) -> RenderedPatch:
     """Render a unified diff patch with new-file line numbers.
 
     Context and added lines get their new-file line number; removed lines are
-    kept with a bare ``-`` prefix. Returns (rendered_text, max_new_line_seen).
+    kept with a bare ``-`` prefix. Lines that only exist in the old file (removed
+    lines, and the gaps between hunks) get no new-file number, so they are absent
+    from ``new_lines``.
     """
     out: list[str] = []
     new_line = 0
     max_new_line = 0
+    new_lines: set[int] = set()
     for line in patch.splitlines():
         match = HUNK_RE.match(line)
         if match:
@@ -53,14 +70,16 @@ def number_patch_lines(patch: str) -> tuple[str, int]:
         if line.startswith("+"):
             out.append(f"{new_line} + {line[1:]}")
             max_new_line = max(max_new_line, new_line)
+            new_lines.add(new_line)
             new_line += 1
         elif line.startswith("-"):
             out.append(f"    - {line[1:]}")
         else:
             out.append(f"{new_line}   {line.removeprefix(' ')}")
             max_new_line = max(max_new_line, new_line)
+            new_lines.add(new_line)
             new_line += 1
-    return "\n".join(out), max_new_line
+    return RenderedPatch("\n".join(out), max_new_line, frozenset(new_lines))
 
 
 def strip_context_lines(patch: str) -> str:
@@ -82,6 +101,7 @@ class DiffFile:
     renamed_file: bool = False
     max_new_line: int = 0
     rendered: str = ""
+    new_lines: frozenset[int] = frozenset()
 
     @property
     def edit_kind(self) -> str:
@@ -106,8 +126,17 @@ class DiffContext:
     renamed_files: list[str] = field(default_factory=list)
 
     @property
-    def max_new_line_by_file(self) -> dict[str, int]:
-        return {f.new_path: f.max_new_line for f in self.files}
+    def commentable_lines_by_file(self) -> dict[str, frozenset[int]]:
+        """new_path -> new-file line numbers we may comment on inline.
+
+        Only files actually put in front of the model (``reviewed_files``) are
+        listed: the model cannot legitimately place an inline comment on a file
+        whose diff it never saw. A file with no reviewable diff (ignored glob,
+        binary, or clipped by the token budget) is absent, and its issues stay in
+        the summary comment.
+        """
+        reviewed = set(self.reviewed_files)
+        return {f.new_path: f.new_lines for f in self.files if f.new_lines and f.new_path in reviewed}
 
 
 def build_diff_context(
@@ -140,7 +169,7 @@ def build_diff_context(
             ctx.deleted_files.append(path)
         elif change.get("renamed_file"):
             ctx.renamed_files.append(path)
-        rendered, max_new_line = number_patch_lines(patch)
+        rendered = number_patch_lines(patch)
         ctx.files.append(
             DiffFile(
                 new_path=path,
@@ -149,8 +178,9 @@ def build_diff_context(
                 new_file=bool(change.get("new_file")),
                 deleted_file=bool(change.get("deleted_file")),
                 renamed_file=bool(change.get("renamed_file")),
-                max_new_line=max_new_line,
-                rendered=rendered,
+                max_new_line=rendered.max_new_line,
+                rendered=rendered.text,
+                new_lines=rendered.new_lines,
             )
         )
 

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 
-from .conf import Conf, RepoToken, get_conf, reload_conf
+from .conf import MAX_FINDINGS, MAX_INLINE_COMMENTS, Conf, RepoToken, get_conf, reload_conf
 from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent, try_register_review
 from .services.diffctx import (
     build_diff_context,
@@ -26,6 +26,7 @@ from .services.llm import (
     parse_review,
     review_with_fallback,
 )
+from .services.prompts import build_system_prompt
 from .services.render import (
     PROGRESS_MARKER,
     REVIEW_MARKER,
@@ -35,6 +36,7 @@ from .services.render import (
     render_skip,
     truncate,
 )
+from .services.mrref import MRRefError, parse_mr_ref
 from .services.tokens import resolve_repo_token
 
 
@@ -75,6 +77,10 @@ SAMPLE_PATCH = """@@ -1,3 +1,4 @@
 +second added
 """
 
+# Dense patch: every line of the new file 1..20 is a hunk line, so tests can
+# place inline comments on any of those lines.
+DENSE_PATCH = "@@ -0,0 +1,20 @@\n" + "".join(f"+line {n}\n" for n in range(1, 21))
+
 GOOD_REVIEW_YAML = (
     "review:\n"
     "  overall_assessment: ok\n"
@@ -97,9 +103,41 @@ class TokenResolverTests(TestCase):
         self.assertEqual(resolve_repo_token(conf, "backend/team-a/svc").token, "tok-team-a")
         self.assertEqual(resolve_repo_token(conf, "backend/payments").token, "tok-backend")
 
-    def test_prefix_is_segment_aware(self):
-        self.assertIsNone(resolve_repo_token(_conf(default_token=""), "backendx/svc"))
-        self.assertEqual(resolve_repo_token(_conf(), "backendx/svc").token, "default-token")
+    def test_prefix_is_a_plain_case_insensitive_string_prefix(self):
+        # Not segment aware: `tp/cneos` must cover `tp/CNEOSv2/...`, and casing
+        # on either side must not matter.
+        conf = _conf(
+            default_token="",
+            repo_tokens=(
+                RepoToken(prefix="tp/cneos", api_url="https://x", token="tok-cneos"),
+            ),
+        )
+        for path in (
+            "tp/CNEOSv2/NetF/npp/npp.v2.0",
+            "TP/cneosv2/netf/npp/npp.v2.0",
+            "tp/cneos",
+            "tp/cneos/",
+        ):
+            self.assertEqual(resolve_repo_token(conf, path).token, "tok-cneos", path)
+
+    def test_prefix_forms_are_equivalent(self):
+        # tp, tp/ and TP/ all normalise to the same prefix.
+        for typed in ("tp", "tp/", "TP", "TP/", " tp/ "):
+            conf = _conf(default_token="", repo_tokens=(RepoToken(prefix=typed, api_url="https://x", token="tok-tp"),))
+            self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/NetF/npp").token, "tok-tp", typed)
+
+    def test_longest_match_wins_across_prefix_set(self):
+        conf = _conf(
+            default_token="",
+            repo_tokens=(
+                RepoToken(prefix="tp", api_url="https://x", token="tok-tp"),
+                RepoToken(prefix="tp/CNE", api_url="https://x", token="tok-cne"),
+                RepoToken(prefix="tp/cneosv2/netf/npp/", api_url="https://x", token="tok-npp"),
+            ),
+        )
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/NetF/npp/npp.v2.0").token, "tok-npp")
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/OS/kernel").token, "tok-cne")
+        self.assertEqual(resolve_repo_token(conf, "tp/other/repo").token, "tok-tp")
 
     def test_default_fallback_and_none(self):
         self.assertEqual(resolve_repo_token(_conf(), "anything/else").token, "default-token")
@@ -108,12 +146,24 @@ class TokenResolverTests(TestCase):
 
 class DiffContextTests(TestCase):
     def test_number_patch_lines(self):
-        rendered, max_new = number_patch_lines(SAMPLE_PATCH)
-        self.assertIn("1   context line 1", rendered)
-        self.assertIn("- removed line", rendered)
-        self.assertIn("2 + added line", rendered)  # removed line does not consume new numbering
-        self.assertIn("12 + second added", rendered)
-        self.assertEqual(max_new, 12)
+        rendered = number_patch_lines(SAMPLE_PATCH)
+        self.assertIn("1   context line 1", rendered.text)
+        self.assertIn("- removed line", rendered.text)
+        self.assertIn("2 + added line", rendered.text)  # removed line does not consume new numbering
+        self.assertIn("12 + second added", rendered.text)
+        self.assertEqual(rendered.max_new_line, 12)
+        # only lines that exist in the new file are commentable; the gap 4..10 is not
+        self.assertEqual(rendered.new_lines, frozenset({1, 2, 3, 11, 12}))
+
+    def test_commentable_lines_only_cover_reviewed_files(self):
+        changes = [
+            {"new_path": "app.py", "old_path": "app.py", "diff": SAMPLE_PATCH},
+            {"new_path": "package-lock.json", "old_path": "package-lock.json", "diff": SAMPLE_PATCH},
+        ]
+        ctx = build_diff_context(changes, max_tokens=10000)
+        commentable = ctx.commentable_lines_by_file
+        self.assertEqual(commentable, {"app.py": frozenset({1, 2, 3, 11, 12})})
+        self.assertNotIn("package-lock.json", commentable)  # filtered file: no inline comments
 
     def test_filter_and_inventory(self):
         changes = [
@@ -137,6 +187,20 @@ class DiffContextTests(TestCase):
     def test_binary_or_empty_patch_filtered(self):
         ctx = build_diff_context([{"new_path": "img.png", "old_path": "img.png", "diff": ""}], max_tokens=100)
         self.assertEqual(ctx.filtered_files, ["img.png"])
+
+
+class PromptTests(TestCase):
+    def test_findings_ordered_by_complexity_then_length(self):
+        system = build_system_prompt(6, "zh-CN")
+        self.assertIn("most complex issue first", system)
+        self.assertIn("equally complex", system)
+        self.assertIn("inline comments in this exact order", system)
+        self.assertIn("Never pad issue_content", system)
+
+    def test_prompt_restricts_comments_to_lines_in_the_diff(self):
+        system = build_system_prompt(6, "zh-CN")
+        self.assertIn("actually present in that file's diff", system)
+        self.assertIn("Never point at a file the diff", system)
 
 
 class LLMParseTests(TestCase):
@@ -523,6 +587,153 @@ class PipelineTests(TestCase):
         summary = [b for b in bodies if REVIEW_MARKER in b and "AI Review" in b][0]
         self.assertNotIn("**1. Bug**", summary)
 
+    @staticmethod
+    def _many_issue_review(count: int) -> ReviewOutput:
+        """A review with *count* issues on app.py (the patch exposes lines 1..12)."""
+        issues = "".join(
+            f"    - relevant_file: app.py\n"
+            f"      issue_header: Bug {n}\n"
+            f"      issue_content: bad {n}\n"
+            f"      start_line: {n + 1}\n"
+            f"      end_line: {n + 1}\n"
+            for n in range(count)
+        )
+        return parse_review(
+            "review:\n  overall_assessment: ok\n  score: 70\n  risk_level: medium\n"
+            f"  key_issues_to_review:\n{issues}"
+            "  relevant_tests: No\n  security_concerns: No\n",
+            num_max_findings=count,  # sidestep the model-side cap on purpose
+        )
+
+    def _run_with_inline_budget(self, count: int, budget: int) -> MagicMock:
+        client = self._client_mock()
+        # dense patch: lines 1..20 all exist in the diff, so the budget is the
+        # only thing that can drop an issue from the inline output
+        client.get_mr_changes.return_value = {
+            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"},
+            "changes": [{"new_path": "app.py", "old_path": "app.py", "diff": DENSE_PATCH}],
+        }
+        review = self._many_issue_review(count)
+        conf = _conf(inline_comments=True, inline_max_comments=budget, num_max_findings=count)
+        with patch("reviewer.services.pipeline.GitLabClient", return_value=client), patch(
+            "reviewer.services.pipeline.review_with_fallback",
+            return_value=(review, "test-model"),
+        ), patch("reviewer.services.pipeline.get_conf", return_value=conf):
+            from .services.pipeline import run_review
+
+            run_review("backend/payments", 1)
+        return client
+
+    def test_inline_comments_capped_by_configured_budget(self):
+        client = self._run_with_inline_budget(count=12, budget=3)
+        self.assertEqual(client.create_inline_discussion.call_count, 3)
+        bodies = [call.args[-1] for call in client.create_note.call_args_list]
+        summary = [b for b in bodies if REVIEW_MARKER in b and "AI Review" in b][0]
+        self.assertIn("**1. Bug 3**", summary)  # the 4th issue onward stays in the summary
+        self.assertNotIn("Bug 0", summary)
+        self.assertEqual(ReviewRecord.objects.get().status, "success")
+
+    def test_inline_budget_zero_falls_back_to_summary_only(self):
+        client = self._run_with_inline_budget(count=3, budget=0)
+        client.create_inline_discussion.assert_not_called()
+        bodies = [call.args[-1] for call in client.create_note.call_args_list]
+        summary = [b for b in bodies if REVIEW_MARKER in b and "AI Review" in b][0]
+        self.assertIn("**1. Bug 0**", summary)
+
+    def test_inline_budget_is_hard_capped_in_publish_stage(self):
+        """Even a budget of 999 cannot exceed the code ceiling."""
+        client = self._run_with_inline_budget(count=12, budget=999)
+        self.assertEqual(client.create_inline_discussion.call_count, MAX_INLINE_COMMENTS)
+
+    @staticmethod
+    def _review_with_off_diff_issue() -> ReviewOutput:
+        """One issue on a file with no diff, one on a real hunk line."""
+        return parse_review(
+            "review:\n  overall_assessment: ok\n  score: 70\n  risk_level: medium\n"
+            "  key_issues_to_review:\n"
+            "    - relevant_file: gen/models.py\n"
+            "      issue_header: Bug\n"
+            "      issue_content: file is not part of this MR\n"
+            "      start_line: 5\n"
+            "      end_line: 5\n"
+            "    - relevant_file: app.py\n"
+            "      issue_header: Bug\n"
+            "      issue_content: real diff issue\n"
+            "      start_line: 2\n"
+            "      end_line: 2\n"
+            "  relevant_tests: No\n  security_concerns: No\n",
+            num_max_findings=6,
+        )
+
+    @staticmethod
+    def _run_with_review(review: ReviewOutput, changes: list[dict]) -> MagicMock:
+        client = MagicMock()
+        client.get_merge_request.return_value = {
+            "sha": "a" * 40,
+            "web_url": "https://gl/g/r/-/merge_requests/1",
+            "title": "Add feature",
+            "description": "does things",
+            "author": {"name": "alice"},
+            "source_branch": "feat",
+            "target_branch": "main",
+            "merge_commit_message": "",
+            "draft": False,
+            "work_in_progress": False,
+        }
+        client.get_mr_changes.return_value = {
+            "diff_refs": {"base_sha": "b", "start_sha": "s", "head_sha": "h"},
+            "changes": changes,
+        }
+        client.get_own_user_id.return_value = 7
+        client.list_notes.return_value = []
+        client.list_discussions.return_value = []
+        note_ids = iter([{"id": 55}, {"id": 66}, {"id": 77}])
+        client.create_note.side_effect = lambda *a, **k: next(note_ids)
+        with patch("reviewer.services.pipeline.GitLabClient", return_value=client), patch(
+            "reviewer.services.pipeline.review_with_fallback", return_value=(review, "test-model")
+        ):
+            from .services.pipeline import run_review
+
+            run_review("backend/payments", 1)
+        return client
+
+    @staticmethod
+    def _summary_body(client: MagicMock) -> str:
+        bodies = [call.args[-1] for call in client.create_note.call_args_list]
+        return [b for b in bodies if REVIEW_MARKER in b and "AI Review" in b][0]
+
+    def test_inline_comment_requires_file_with_diff(self):
+        """An issue on a file the MR does not touch must never go inline."""
+        client = self._run_with_review(
+            self._review_with_off_diff_issue(),
+            [{"new_path": "app.py", "old_path": "app.py", "diff": SAMPLE_PATCH}],
+        )
+        client.create_inline_discussion.assert_called_once()
+        self.assertEqual(client.create_inline_discussion.call_args.args[3]["new_path"], "app.py")
+        summary = self._summary_body(client)
+        self.assertIn("file is not part of this MR", summary)  # off-diff issue falls back to summary
+        self.assertNotIn("real diff issue", summary)
+        self.assertEqual(ReviewRecord.objects.get().status, "success")
+
+    def test_inline_comment_requires_line_inside_diff_hunks(self):
+        """Line 7 only exists between the two hunks of SAMPLE_PATCH, not in the diff."""
+        review = parse_review(
+            "review:\n  overall_assessment: ok\n  score: 70\n  risk_level: low\n"
+            "  key_issues_to_review:\n"
+            "    - relevant_file: app.py\n"
+            "      issue_header: Bug\n"
+            "      issue_content: line lives between hunks\n"
+            "      start_line: 7\n"
+            "      end_line: 7\n"
+            "  relevant_tests: No\n  security_concerns: No\n",
+            num_max_findings=6,
+        )
+        client = self._run_with_review(
+            review, [{"new_path": "app.py", "old_path": "app.py", "diff": SAMPLE_PATCH}]
+        )
+        client.create_inline_discussion.assert_not_called()
+        self.assertIn("line lives between hunks", self._summary_body(client))
+
 
 def _clear_db_config():
     Setting.objects.all().delete()
@@ -569,7 +780,8 @@ class ConfDbOverrideTests(TestCase):
             repo = resolve_repo_token(conf, "backend/team/svc")
             self.assertEqual(repo.token, "glpat-db")
             self.assertEqual(repo.api_url, "https://db.example.com")
-            self.assertEqual(resolve_repo_token(conf, "backend/teamx/svc"), None)
+            self.assertEqual(repo.prefix, "backend/team")
+            self.assertIsNone(resolve_repo_token(conf, "other/repo"))
             # disabled entries drop out of the table
             RepoTokenEntry.objects.update(enabled=False)
             self.assertEqual(reload_conf().repo_tokens, ())
@@ -581,6 +793,23 @@ class ConfDbOverrideTests(TestCase):
             self.assertEqual(get_conf().model, "cached-model")  # within TTL
             reload_conf()
             self.assertEqual(get_conf().model, "fresh-model")  # forced refresh
+
+    def test_env_cannot_exceed_inline_and_findings_ceilings(self):
+        with patch.dict(os.environ, {"GITLABMR_INLINE_MAX_COMMENTS": "999",
+                                    "GITLABMR_NUM_MAX_FINDINGS": "999"}):
+            conf = reload_conf()
+        self.assertEqual(conf.inline_max_comments, MAX_INLINE_COMMENTS)
+        self.assertEqual(conf.num_max_findings, MAX_FINDINGS)
+
+    def test_db_cannot_exceed_inline_and_findings_ceilings(self):
+        Setting.objects.create(inline_max_comments=500, num_max_findings=100)
+        conf = reload_conf()
+        self.assertEqual(conf.inline_max_comments, MAX_INLINE_COMMENTS)
+        self.assertEqual(conf.num_max_findings, MAX_FINDINGS)
+
+    def test_inline_budget_zero_disables_inline(self):
+        Setting.objects.create(inline_max_comments=0)
+        self.assertEqual(reload_conf().inline_max_comments, 0)
 
 
 class UiAuthTests(TestCase):
@@ -608,6 +837,39 @@ class UiAuthTests(TestCase):
             self.assertRedirects(resp, "/")
 
 
+class MRRefTests(TestCase):
+    def test_parses_mr_page_url(self):
+        ref = parse_mr_ref(
+            "https://gitlab.inone.nsfocus.com/tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS/-/merge_requests/118"
+        )
+        self.assertEqual(ref.project_path, "tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS")
+        self.assertEqual(ref.iid, 118)
+        self.assertEqual(ref.host, "gitlab.inone.nsfocus.com")
+        self.assertEqual(ref.short, "tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS!118")
+
+    def test_url_variants(self):
+        cases = {
+            "https://gl.example.com/a/b/-/merge_requests/7/diffs?tab=x#note_1": ("a/b", 7, "gl.example.com"),
+            "https://gl.example.com:8443/a/b/merge_requests/7": ("a/b", 7, "gl.example.com"),
+            "gl.example.com/a/b/-/merge_requests/7": ("a/b", 7, "gl.example.com"),
+            "a/b/-/merge_requests/7": ("a/b", 7, ""),
+            "  https://gl.example.com/a/b/-/merge_requests/7  ": ("a/b", 7, "gl.example.com"),
+        }
+        for raw, (project, iid, host) in cases.items():
+            ref = parse_mr_ref(raw)
+            self.assertEqual((ref.project_path, ref.iid, ref.host), (project, iid, host), raw)
+
+    def test_shortcut_forms(self):
+        for raw in ("group/sub/repo!42", "group/sub/repo 42", "group/sub/repo#42"):
+            ref = parse_mr_ref(raw)
+            self.assertEqual((ref.project_path, ref.iid, ref.host), ("group/sub/repo", 42, ""), raw)
+
+    def test_rejects_unusable_input(self):
+        for raw in ("", "group/repo", "!42", "group/repo!abc", "https://gl.example.com/-/merge_requests/12"):
+            with self.assertRaises(MRRefError, msg=raw):
+                parse_mr_ref(raw)
+
+
 class DashboardTests(TestCase):
     def setUp(self):
         patcher = patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": ""})
@@ -632,15 +894,44 @@ class DashboardTests(TestCase):
         self.assertContains(resp, "88")
         self.assertContains(resp, "review")
 
-    def test_trigger_review(self):
+    def test_trigger_review_from_mr_url(self):
+        url = "https://gitlab.example.com/backend/payments/-/merge_requests/7"
         with patch("reviewer.ui.get_conf", return_value=_conf()), patch("reviewer.ui.submit_review") as submit:
-            resp = self.client.post("/review/trigger/", {"project": "Backend/Payments", "mr_iid": "7"})
+            resp = self.client.post("/review/trigger/", {"mr_ref": url})
             self.assertRedirects(resp, "/")
             submit.assert_called_once_with("backend/payments", 7, source="manual")
+
+    def test_trigger_review_keeps_project_casing(self):
+        # webhook payloads keep the original path casing -> same review identity
+        url = "https://gitlab.example.com/Backend/Payments/-/merge_requests/7"
+        with patch("reviewer.ui.get_conf", return_value=_conf()), patch("reviewer.ui.submit_review") as submit:
+            self.client.post("/review/trigger/", {"mr_ref": url})
+        submit.assert_called_once_with("Backend/Payments", 7, source="manual")
+
+    def test_trigger_review_legacy_two_fields(self):
+        with patch("reviewer.ui.get_conf", return_value=_conf()), patch("reviewer.ui.submit_review") as submit:
+            self.client.post("/review/trigger/", {"project": "backend/payments", "mr_iid": "7"})
+        submit.assert_called_once_with("backend/payments", 7, source="manual")
+
+    def test_trigger_review_rejects_bad_input(self):
+        with patch("reviewer.ui.get_conf", return_value=_conf()), patch("reviewer.ui.submit_review") as submit:
+            for payload in ({"mr_ref": "nonsense"}, {"mr_ref": ""}):
+                resp = self.client.post("/review/trigger/", payload)
+                self.assertRedirects(resp, "/")
+        submit.assert_not_called()
+
+    def test_trigger_review_host_mismatch_blocked(self):
+        url = "https://gitlab.other.example.com/backend/payments/-/merge_requests/7"
+        with patch("reviewer.ui.get_conf", return_value=_conf()), patch("reviewer.ui.submit_review") as submit:
+            self.client.post("/review/trigger/", {"mr_ref": url})
+        submit.assert_not_called()  # wrong instance: would review the wrong repo
+
+    def test_trigger_review_without_token_blocked(self):
+        url = "https://gitlab.example.com/unknown/repo/-/merge_requests/7"
         with patch("reviewer.ui.get_conf", return_value=_conf(default_token="")), \
                 patch("reviewer.ui.submit_review") as submit:
-            self.client.post("/review/trigger/", {"project": "unknown/repo", "mr_iid": "7"})
-        submit.assert_not_called()  # no matching token -> blocked with a message
+            self.client.post("/review/trigger/", {"mr_ref": url})
+        submit.assert_not_called()
 
     def test_detail_and_retry(self):
         record = self._record(status="failed", error_reason="http_error")
@@ -704,6 +995,29 @@ class SettingsViewTests(TestCase):
         self.assertEqual(conf.model, "db-model")
         self.assertEqual(conf.llm_api_key, "sk-2")
 
+    def test_repo_form_collapsed_until_requested(self):
+        RepoTokenEntry.objects.create(prefix="backend/team", token="glpat-db")
+        # plain page: only the table + an "add" entry point, no add/edit form
+        resp = self.client.get("/settings/repos/")
+        self.assertContains(resp, "多仓库前缀令牌")
+        self.assertContains(resp, "新增前缀")
+        self.assertNotContains(resp, 'id="repo-form"')
+        self.assertNotContains(resp, "用途说明")  # field unique to the add/edit form
+        # "编辑" opens the form, prefilled from the stored entry; prefix stays editable (rename)
+        resp = self.client.get("/settings/repos/?edit=backend/team")
+        self.assertContains(resp, 'id="repo-form"')
+        self.assertContains(resp, 'name="prefix" value="backend/team"')
+        self.assertNotContains(resp, "readonly")
+        self.assertContains(resp, 'name="entry_id" value="')
+        self.assertContains(resp, "保存修改")
+        self.assertNotContains(resp, "新增前缀")
+        # "新增" opens the same form empty, prefix editable
+        resp = self.client.get("/settings/repos/?new=1")
+        self.assertContains(resp, 'id="repo-form"')
+        self.assertContains(resp, 'name="prefix" value=""')
+        self.assertNotContains(resp, "readonly")
+        self.assertContains(resp, "添加 / 更新前缀")
+
     def test_repo_token_add_update_delete(self):
         resp = self.client.post("/settings/repos/", {
             "action": "save_repo", "prefix": "Backend/Team", "token": "glpat-1",
@@ -726,3 +1040,29 @@ class SettingsViewTests(TestCase):
         self.client.post("/settings/repos/", {"action": "delete_repo", "prefix": "backend/team"})
         self.assertEqual(RepoTokenEntry.objects.count(), 0)
         self.assertEqual(resolve_repo_token(reload_conf(), "backend/team/svc"), None)
+
+    def test_repo_token_rename_by_id(self):
+        entry = RepoTokenEntry.objects.create(prefix="backend/team", token="glpat-1", api_url="https://a.example.com")
+        # 编辑态按主键更新：改前缀 = 重命名，令牌留空保持不变
+        resp = self.client.post("/settings/repos/", {
+            "action": "save_repo", "entry_id": str(entry.pk), "prefix": "Backend/Team-A", "token": "",
+            "api_url": "https://a.example.com", "enabled": "on",
+        })
+        self.assertRedirects(resp, "/settings/repos/")
+        self.assertEqual(RepoTokenEntry.objects.count(), 1)
+        entry.refresh_from_db()
+        self.assertEqual((entry.prefix, entry.token), ("backend/team-a", "glpat-1"))
+        conf = reload_conf()
+        self.assertEqual(resolve_repo_token(conf, "backend/team-a/svc").token, "glpat-1")
+        self.assertIsNone(resolve_repo_token(conf, "backend/team/svc"))
+
+    def test_repo_token_rename_conflict_rejected(self):
+        a = RepoTokenEntry.objects.create(prefix="backend/team", token="glpat-1")
+        RepoTokenEntry.objects.create(prefix="backend/other", token="glpat-2")
+        self.client.post("/settings/repos/", {
+            "action": "save_repo", "entry_id": str(a.pk), "prefix": "backend/other", "token": "", "enabled": "on",
+        })
+        a.refresh_from_db()
+        self.assertEqual(a.prefix, "backend/team")  # 冲突时不改名
+        self.assertEqual(RepoTokenEntry.objects.count(), 2)
+        self.assertEqual(a.token, "glpat-1")  # 令牌也不会被覆盖

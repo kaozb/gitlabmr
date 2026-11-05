@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from django.db import close_old_connections
 
-from ..conf import get_conf
+from ..conf import MAX_INLINE_COMMENTS, get_conf
 from ..models import ReviewRecord, try_register_review
 from .diffctx import DiffContext, build_diff_context, estimate_tokens
 from .gitlab import GitLabClient, GitLabError
@@ -135,7 +135,9 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
     masked = f"{repo.token[:4]}****{repo.token[-4:]}" if repo.token else "(empty)"
     tracker.done("token", f"命中前缀 `{repo.prefix or '(默认)'}`，令牌 {masked}")
 
-    client = GitLabClient(repo.api_url, repo.token, timeout=conf.gitlab_timeout)
+    # same fallback the dashboard uses for the host check: a prefix entry may
+    # leave api_url empty, in which case the default GitLab address applies.
+    client = GitLabClient(repo.api_url or conf.default_api_url, repo.token, timeout=conf.gitlab_timeout)
 
     # -- stage 2: read MR
     tracker.start("read_mr")
@@ -239,7 +241,13 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
         inline_published: set[int] = set()
         if conf.inline_comments and review.key_issues_to_review:
             inline_published = _publish_inline_comments(
-                client, project_path, mr_iid, review, diff_ctx, changes_resp.get("diff_refs") or {}
+                client,
+                project_path,
+                mr_iid,
+                review,
+                diff_ctx,
+                changes_resp.get("diff_refs") or {},
+                limit=conf.inline_max_comments,
             )
 
         summary_issues = [i for n, i in enumerate(review.key_issues_to_review) if n not in inline_published]
@@ -399,12 +407,30 @@ def _publish_inline_comments(
     review: ReviewOutput,
     diff_ctx: DiffContext,
     diff_refs: dict,
+    limit: int = MAX_INLINE_COMMENTS,
 ) -> set[int]:
     """Publish key issues as inline discussions; returns indices published.
 
-    Issues that fail validation or publication stay in the summary comment.
+    Two gates decide whether an issue may go inline:
+
+    1. **only files with a diff** - the file must be in the diff the model was
+       given, and ``start_line`` must be a line that actually exists in that
+       file's new version (a hunk line, not a gap between hunks). Anything else
+       would either 400 on GitLab's position API or annotate code the model
+       never saw.
+    2. **budget** - the budget is clamped to ``MAX_INLINE_COMMENTS`` here, so a
+       huge ``num_max_findings`` (or a model that ignores the prompt) can never
+       flood the MR with threads.
+
+    Issues that fail either gate stay in the summary comment, so nothing is ever
+    silently dropped.
     """
-    max_line_by_file = diff_ctx.max_new_line_by_file
+    budget = min(int(limit), MAX_INLINE_COMMENTS) if limit is not None else MAX_INLINE_COMMENTS
+    budget = max(budget, 0)
+    if budget == 0:
+        return set()
+
+    commentable = diff_ctx.commentable_lines_by_file
     own_id = client.get_own_user_id()
     existing: set[tuple[str, int]] = set()
     if own_id is not None:
@@ -424,10 +450,24 @@ def _publish_inline_comments(
         return published
 
     for index, issue in enumerate(review.key_issues_to_review):
-        max_line = max_line_by_file.get(issue.relevant_file)
-        if max_line is None or issue.start_line > max_line or issue.end_line > max_line:
+        if len(published) >= budget:
+            logger.info(
+                "inline comment budget %d reached, %d issue(s) left in summary",
+                budget,
+                len(review.key_issues_to_review) - index,
+            )
+            break
+        file_lines = commentable.get(issue.relevant_file)
+        if not file_lines:
             logger.warning(
-                "inline issue out of range, keeping in summary: %s L%d", issue.relevant_file, issue.start_line
+                "inline issue skipped, file has no reviewable diff in this MR: %s", issue.relevant_file
+            )
+            continue
+        if issue.start_line not in file_lines:
+            logger.warning(
+                "inline issue skipped, line %d is not part of the diff hunks of %s",
+                issue.start_line,
+                issue.relevant_file,
             )
             continue
         if (issue.relevant_file, issue.start_line - 1) in existing:

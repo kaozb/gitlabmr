@@ -35,8 +35,8 @@ python manage.py test reviewer -v 1
 
 启动后打开 `http://<your-host>:8000/` 即是控制台首页：
 
-- **评审总览**：成功/失败/进行中/跳过统计、最近 50 条评审记录（状态、评分、风险、问题数、模型、耗时）、最近 20 条 Webhook 事件，并可**手动触发评审**（填项目路径 + MR IID）与**一键重试失败评审**（点进详情页）。
-- **服务设置**（`/settings/`）：直接在网页上配置全局项（Webhook 密钥、默认 GitLab 地址/令牌、LLM 接口与模型、回退模型、diff 预算、行内评论、忽略分支等）以及**多仓库前缀令牌**（增删改、启用/停用）。
+- **评审总览**：成功/失败/进行中/跳过统计、最近 50 条评审记录（状态、评分、风险、问题数、模型、耗时）、最近 20 条 Webhook 事件，并可**手动触发评审**（直接把浏览器地址栏的 MR 链接粘进输入框即可，也支持 `group/repo!42` 简写）与**一键重试失败评审**（点进详情页）。
+- **服务设置**（`/settings/`）：直接在网页上配置全局项（Webhook 密钥、默认 GitLab 地址/令牌、LLM 接口与模型、回退模型、diff 预算、行内评论、忽略分支等）以及**多仓库前缀令牌**（增删改、启用/停用；列表默认只展示表格，点「＋ 新增前缀」或某行「编辑」才展开表单；编辑态所有字段（含前缀本身）都可修改，改前缀等于按记录 ID 重命名，与其他前缀冲突时会被拒绝）。
 - **立即生效**：设置保存在数据库中，优先于环境变量；文本/数字留空 = 沿用环境变量，密钥留空 = 保持不变。配置缓存约 10 秒自动刷新，无需重启进程（`workers` 除外，改后需重启）。数据库令牌表非空时整体取代 env/文件令牌，清空则回落到 env/文件配置。
 - **访问保护**：设置环境变量 `GITLABMR_UI_PASSWORD` 后，控制台需要密码登录（session 会话）；不设置则免登录（仅建议内网使用）。密钥在页面中只显示掩码（`glpa****56`），不会回显明文。
 
@@ -49,7 +49,7 @@ default:                      # 未命中前缀时兜底（可省略，省略则
   api_url: https://gitlab.com
   token: glpat-default
 repos:
-  - prefix: backend/          # 匹配 project path 前缀，长前缀优先，段感知
+  - prefix: backend/          # 匹配 project path 前缀，纯字符串前缀，长前缀优先
     api_url: https://gitlab.example.com
     token: glpat-backend
     webhook_secret: whsec-b1  # 可选：该仓库 webhook 的独立令牌
@@ -57,9 +57,23 @@ repos:
     token: glpat-team-a
 ```
 
-- `backend/team-a/svc` 命中 `backend/team-a/`；`backend/pay` 命中 `backend/`；`backendx` 什么都不命中（段感知，不会误配）。
+- 所有前缀视为一个集合，逐个对 MR 的项目路径做**忽略大小写**的字符串前缀匹配，命中项里**前缀最长**的那条胜出。
+- 前缀写法等价：`tp`、`tp/`、`TP` 都能命中 `tp/CNEOSv2/NetF/npp/npp.v2.0`；`tp/CNE` 同样命中（非段边界也匹配）。
+- `backend/team-a/svc` 命中 `backend/team-a/`，`backend/pay` 命中 `backend/`；只配了 `backend` 时 `backendx/svc` 也会命中 `backend`——需要更精确就把更长、更具体的前缀加进集合（最长者优先）。
 - 每次评审将解析出的令牌作为参数显式传递，无全局可变状态，多仓库并发天然隔离。
 - 除了 env/文件，也可以直接在控制台「服务设置」页维护这批令牌（存数据库，优先级更高，见上文）。
+
+## 手动触发评审
+
+控制台首页的输入框只认一样东西：**MR 链接**。从浏览器地址栏复制整条 URL 粘上去提交即可，无需拆分项目路径和 IID：
+
+```
+https://gitlab.inone.nsfocus.com/tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS/-/merge_requests/118
+```
+
+- 兼容 `.../merge_requests/118/diffs`、带 `?query`/`#fragment` 的链接、旧式无 `/-/` 的链接。
+- 也接受简写 `group/sub/repo!118`（`#118`、空格分隔同样识别），方便从聊天里复制。
+- 链接里的域名会与命中令牌的 `api_url` 比对，不一致直接拒绝，避免把评审发到另一个 GitLab 实例；项目路径保留原始大小写，与 Webhook 记录的评审身份一致（同一 head sha 不会重复评审）。
 
 ## GitLab 侧配置
 
@@ -70,7 +84,8 @@ repos:
 ## 评审结论回写行为
 
 - 总结评论：默认**新建**；后续评审如果找到"带 `<!-- gitlabmr:review -->` 标记且作者为本 bot 账号"的历史评论，会**原位更新**（绝不覆盖人工评论）。
-- 行内评论（`GITLABMR_INLINE_COMMENTS=true`）：关键问题定位到文件+行（GitLab position，0-based，三 sha 取自 `diff_refs`），同一位置已有 bot 评论则跳过；定位失败的问题回落到总结评论，不会丢失。
+- 行内评论（`GITLABMR_INLINE_COMMENTS=true`）：**只对本次 diff 里真实存在的文件与行**发起（文件必须被纳入评审，行号必须落在该文件的 hunk 行上；被忽略规则过滤、二进制、纯删除或超出 token 预算未送进模型的文件一律不发行内评论），position 使用 GitLab 的 0-based 行号、三 sha 取自 `diff_refs`，同一位置已有 bot 评论则跳过；不满足条件或发布失败的问题回落到总结评论，不会丢失。**条数上限**由 `GITLABMR_INLINE_MAX_COMMENTS`（默认 10）控制，代码内还有 `MAX_INLINE_COMMENTS=10` 的硬封顶——把 `num_max_findings` 调多大都不会刷屏，超出的问题留在总结评论里（设 0 = 不发行内评论）。
+- 行内评论的**选取顺序**由 prompt 约束（软要求，不做事后重排）：问题按复杂度从高到低排序（崩溃/数据损坏/安全 > 逻辑错误 > 性能 > 可维护性，并考虑影响范围与触发难度），复杂度相同时把 `issue_content` 更长、更详细的一条放前面；预算是按这个顺序消费的，因此越复杂的问题越先拿到行内评论名额，其余进总结评论。
 - 失败回写：LLM/GitLab 出错时在 MR 发一条脱敏失败评论（错误按白名单归类，不泄漏堆栈）。
 - 幂等：同一 MR 同一 head sha 只评审一次（数据库唯一约束），failed 的记录重试时自动重置。
 

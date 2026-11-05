@@ -5,7 +5,7 @@
 <p class="sub">模型接口与评审行为，保存在数据库中并<strong>立即生效</strong>（无需重启）；文本/数字留空表示沿用环境变量默认值，密钥留空表示保持不变。</p>
 {% else %}
 <h1>仓库令牌</h1>
-<p class="sub">GitLab 连接与多仓库前缀令牌，保存在数据库中并<strong>立即生效</strong>；密钥留空表示保持不变。多个前缀同时命中时<strong>最长前缀优先</strong>。</p>
+<p class="sub">GitLab 连接与多仓库前缀令牌，保存在数据库中并<strong>立即生效</strong>；密钥留空表示保持不变。所有前缀构成一个集合逐个匹配 MR 项目路径（忽略大小写），多个前缀同时命中时<strong>最长前缀优先</strong>。</p>
 {% endif %}
 
 <div class="card">
@@ -14,24 +14,28 @@
     <input type="hidden" name="action" value="save_settings">
     {% for group in groups %}
       <div class="fieldset-title">{{ group.title }} <span class="muted" style="font-weight:400">· {{ group.hint }}</span></div>
-      {% for row in group.rows %}
-        <label for="id-{{ row.name }}">{{ row.label }}</label>
-        {% if row.kind == "tristate" %}
-          <select id="id-{{ row.name }}" name="{{ row.name }}">
-            <option value="" {% if row.inherit %}selected{% endif %}>跟随环境变量</option>
-            <option value="true" {% if row.is_true %}selected{% endif %}>开启</option>
-            <option value="false" {% if row.is_false %}selected{% endif %}>关闭</option>
-          </select>
-        {% elif row.kind == "password" %}
-          <input type="password" id="id-{{ row.name }}" name="{{ row.name }}" value="" autocomplete="new-password"
-                 placeholder="{% if row.current %}已配置（{{ row.current }}），留空保持不变{% else %}未配置{% endif %}">
-        {% elif row.kind == "number" %}
-          <input type="number" id="id-{{ row.name }}" name="{{ row.name }}" value="{{ row.value }}">
-        {% else %}
-          <input type="text" id="id-{{ row.name }}" name="{{ row.name }}" value="{{ row.value }}">
-        {% endif %}
-        {% if row.hint %}<div class="hint">{{ row.hint }}</div>{% endif %}
-      {% endfor %}
+      <div class="grid cols-3">
+        {% for row in group.rows %}
+          <div class="field">
+            <label for="id-{{ row.name }}">{{ row.label }}</label>
+            {% if row.kind == "tristate" %}
+              <select id="id-{{ row.name }}" name="{{ row.name }}">
+                <option value="" {% if row.inherit %}selected{% endif %}>跟随环境变量</option>
+                <option value="true" {% if row.is_true %}selected{% endif %}>开启</option>
+                <option value="false" {% if row.is_false %}selected{% endif %}>关闭</option>
+              </select>
+            {% elif row.kind == "password" %}
+              <input type="password" id="id-{{ row.name }}" name="{{ row.name }}" value="" autocomplete="new-password"
+                     placeholder="{% if row.current %}已配置（{{ row.current }}），留空保持不变{% else %}未配置{% endif %}">
+            {% elif row.kind == "number" %}
+              <input type="number" id="id-{{ row.name }}" name="{{ row.name }}" value="{{ row.value }}">
+            {% else %}
+              <input type="text" id="id-{{ row.name }}" name="{{ row.name }}" value="{{ row.value }}">
+            {% endif %}
+            {% if row.hint %}<div class="hint">{{ row.hint }}</div>{% endif %}
+          </div>
+        {% endfor %}
+      </div>
     {% endfor %}
     <div style="margin-top:20px"><button class="btn primary" type="submit">保存设置</button></div>
   </form>
@@ -41,7 +45,10 @@
 <div class="card">
   <div class="card-head">
     <h2>多仓库前缀令牌</h2>
-    <span class="muted">{% if using_db_tokens %}当前使用数据库令牌表（优先于 env/文件配置）{% else %}数据库无令牌，正在使用 env/文件配置{% endif %}</span>
+    <div style="display:flex;align-items:center;gap:12px">
+      <span class="muted">{% if using_db_tokens %}当前使用数据库令牌表（优先于 env/文件配置）{% else %}数据库无令牌，正在使用 env/文件配置{% endif %}</span>
+      {% if not show_repo_form %}<a class="btn small primary" href="?new=1#repo-form">＋ 新增前缀</a>{% endif %}
+    </div>
   </div>
 
   {% if repo_entries %}
@@ -57,7 +64,7 @@
         <td>{% if entry.enabled %}<span class="pill-yes">开</span>{% else %}<span class="pill-no">关</span>{% endif %}</td>
         <td class="muted">{{ entry.note|default:"—" }}</td>
         <td>
-          <a class="btn small" href="?edit={{ entry.prefix }}">编辑</a>
+          <a class="btn small" href="?edit={{ entry.prefix|urlencode }}#repo-form">编辑</a>
           <form class="inline" method="post" onsubmit="return confirm('确认删除 {{ entry.prefix }} ？')">
             {% csrf_token %}
             <input type="hidden" name="action" value="delete_repo">
@@ -70,47 +77,52 @@
     </tbody>
   </table>
   {% else %}
-  <div class="empty">还没有令牌配置 —— 为每个仓库前缀添加一条，评审时按最长前缀匹配自动选用。</div>
+  <div class="empty">还没有令牌配置 —— 点上方「＋ 新增前缀」添加一条，评审时按最长前缀匹配自动选用。</div>
   {% endif %}
 
-  <div class="fieldset-title">{% if editing %}编辑前缀：<span class="mono">{{ editing.prefix }}</span>{% else %}新增 / 覆盖令牌{% endif %}</div>
-  <form method="post">
-    {% csrf_token %}
-    <input type="hidden" name="action" value="save_repo">
-    <div class="grid cols-3">
-      <div>
-        <label>仓库前缀 *</label>
-        <input type="text" name="prefix" value="{{ editing.prefix|default:'' }}" placeholder="backend/team-a" {% if editing %}readonly{% endif %}>
-        <div class="hint">匹配 project path 前缀（段感知），如 backend 也匹配 backend/api。</div>
+  {% if show_repo_form %}
+  <div id="repo-form">
+    <div class="fieldset-title">{% if editing %}编辑前缀：<span class="mono">{{ editing.prefix }}</span>{% else %}新增 / 覆盖令牌{% endif %}</div>
+    <form method="post">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="save_repo">
+      {% if editing %}<input type="hidden" name="entry_id" value="{{ editing.pk }}">{% endif %}
+      <div class="grid cols-3">
+        <div>
+          <label>仓库前缀 *</label>
+          <input type="text" name="prefix" value="{{ editing.prefix|default:'' }}" placeholder="backend/team-a">
+          <div class="hint">匹配 project path 前缀（忽略大小写，不区分段边界），如 tp / tp/ / tp/CNE 都能匹配 tp/CNEOSv2/NetF/...；多条命中时取前缀最长者。{% if editing %}修改前缀即重命名该条配置（不能与已有前缀重复）。{% endif %}</div>
+        </div>
+        <div>
+          <label>API 地址</label>
+          <input type="text" name="api_url" value="{{ editing.api_url|default:'' }}" placeholder="留空使用默认 GitLab 地址">
+        </div>
+        <div>
+          <label>访问令牌 {% if editing %}（留空保持不变）{% else %}*{% endif %}</label>
+          <input type="password" name="token" value="" autocomplete="new-password"
+                 placeholder="{% if editing %}已配置，留空保持不变{% else %}glpat-xxxx{% endif %}">
+        </div>
+        <div>
+          <label>Webhook 密钥（可选）</label>
+          <input type="text" name="webhook_secret" value="{{ editing.webhook_secret|default:'' }}" placeholder="该仓库 webhook 的独立 Secret token">
+        </div>
+        <div>
+          <label>备注（可选）</label>
+          <input type="text" name="note" value="{{ editing.note|default:'' }}" placeholder="用途说明">
+        </div>
+        <div>
+          <label>启用</label>
+          <input type="checkbox" name="enabled" {% if not editing or editing.enabled %}checked{% endif %} style="width:auto;margin-top:8px">
+          <div class="hint">停用的令牌不参与匹配。</div>
+        </div>
       </div>
-      <div>
-        <label>API 地址</label>
-        <input type="text" name="api_url" value="{{ editing.api_url|default:'' }}" placeholder="留空使用默认 GitLab 地址">
+      <div style="margin-top:16px">
+        <button class="btn primary" type="submit">{% if editing %}保存修改{% else %}添加 / 更新前缀{% endif %}</button>
+        <a class="btn" href="{% url 'reviewer:settings-repos' %}">取消</a>
       </div>
-      <div>
-        <label>访问令牌 {% if editing %}（留空保持不变）{% else %}*{% endif %}</label>
-        <input type="password" name="token" value="" autocomplete="new-password"
-               placeholder="{% if editing %}已配置，留空保持不变{% else %}glpat-xxxx{% endif %}">
-      </div>
-      <div>
-        <label>Webhook 密钥（可选）</label>
-        <input type="text" name="webhook_secret" value="{{ editing.webhook_secret|default:'' }}" placeholder="该仓库 webhook 的独立 Secret token">
-      </div>
-      <div>
-        <label>备注（可选）</label>
-        <input type="text" name="note" value="{{ editing.note|default:'' }}" placeholder="用途说明">
-      </div>
-      <div>
-        <label>启用</label>
-        <input type="checkbox" name="enabled" {% if not editing or editing.enabled %}checked{% endif %} style="width:auto;margin-top:8px">
-        <div class="hint">停用的令牌不参与匹配。</div>
-      </div>
-    </div>
-    <div style="margin-top:16px">
-      <button class="btn primary" type="submit">{% if editing %}更新该前缀{% else %}添加 / 更新前缀{% endif %}</button>
-      {% if editing %}<a class="btn" href="{% url 'reviewer:settings-repos' %}">取消编辑</a>{% endif %}
-    </div>
-  </form>
+    </form>
+  </div>
+  {% endif %}
 </div>
 {% endif %}
 {% endblock %}

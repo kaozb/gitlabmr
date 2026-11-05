@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
-from ..conf import Conf, RepoToken
+from dataclasses import replace
+
+from ..conf import Conf, RepoToken, normalize_prefix
 
 
 def resolve_repo_token(conf: Conf, project_path: str) -> RepoToken | None:
     """Return the RepoToken whose prefix matches ``project_path`` longest, else the default.
 
-    ``project_path`` looks like ``group/subgroup/repo``. Prefix matching is
-    segment-aware: prefix ``backend`` matches ``backend/api`` but not ``backendx``.
-    Returns None when nothing matches and no default token is configured.
+    The configured prefixes are treated as one set: every prefix is tried against
+    the project path (case-insensitive, plain string prefix - not segment aware,
+    so ``tp/cneos`` also covers ``tp/CNEOSv2/...``), and the entry whose prefix is
+    the longest wins. ``tp``, ``tp/`` and ``TP`` are all the same prefix once
+    normalised. Returns None when nothing matches and no default token is set.
     """
-    path = (project_path or "").strip("/").lower()
+    path = normalize_prefix(project_path)
     best: RepoToken | None = None
+    best_len = -1
     for entry in conf.repo_tokens:
-        if path == entry.prefix or path.startswith(entry.prefix + "/"):
-            if best is None or len(entry.prefix) > len(best.prefix):
-                best = entry
+        prefix = normalize_prefix(entry.prefix)
+        if not prefix:  # a blank prefix would swallow every project path
+            continue
+        if not (path == prefix or path.startswith(prefix)):
+            continue
+        if len(prefix) > best_len:
+            # Keep the original entry but expose the canonical prefix for logs/UI.
+            best, best_len = (entry if entry.prefix == prefix else replace(entry, prefix=prefix)), len(prefix)
     if best is not None:
         return best
     if conf.default_token:
