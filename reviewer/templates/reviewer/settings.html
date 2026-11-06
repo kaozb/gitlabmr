@@ -5,7 +5,7 @@
 <p class="sub">模型接口与评审行为，保存在数据库中并<strong>立即生效</strong>（无需重启）；文本/数字留空表示沿用环境变量默认值，密钥留空表示保持不变。</p>
 {% else %}
 <h1>仓库令牌</h1>
-<p class="sub">GitLab 连接与多仓库前缀令牌，保存在数据库中并<strong>立即生效</strong>；密钥留空表示保持不变。所有前缀构成一个集合逐个匹配 MR 项目路径（忽略大小写），多个前缀同时命中时<strong>最长前缀优先</strong>。</p>
+<p class="sub">GitLab 连接与多仓库令牌，保存在数据库中并<strong>立即生效</strong>；密钥留空表示保持不变。每条配置的 <strong>API 地址</strong>是一个 GitLab URL 前缀（如 https://gitlab.example.com/tp/CNEOSv2/Engine/epi-5.），所有启用条目构成一个集合逐个匹配目标仓库，能命中的里面<strong>地址最长者生效</strong>。</p>
 {% endif %}
 
 <div class="card">
@@ -44,31 +44,31 @@
 {% if show_repos %}
 <div class="card">
   <div class="card-head">
-    <h2>多仓库前缀令牌</h2>
+    <h2>多仓库令牌</h2>
     <div style="display:flex;align-items:center;gap:12px">
       <span class="muted">{% if using_db_tokens %}当前使用数据库令牌表（优先于 env/文件配置）{% else %}数据库无令牌，正在使用 env/文件配置{% endif %}</span>
-      {% if not show_repo_form %}<a class="btn small primary" href="?new=1#repo-form">＋ 新增前缀</a>{% endif %}
+      {% if not show_repo_form %}<a class="btn small primary" href="?new=1#repo-form">＋ 新增令牌</a>{% endif %}
     </div>
   </div>
 
   {% if repo_entries %}
   <table>
-    <thead><tr><th>前缀</th><th>API 地址</th><th>令牌</th><th>Webhook 密钥</th><th>启用</th><th>备注</th><th>操作</th></tr></thead>
+    <thead><tr><th>产品</th><th>API 地址（匹配依据，最长者优先）</th><th>令牌</th><th>Webhook 密钥</th><th>启用</th><th>备注</th><th>操作</th></tr></thead>
     <tbody>
       {% for entry in repo_entries %}
       <tr>
-        <td class="mono">{{ entry.prefix }}</td>
-        <td class="mono">{{ entry.api_url|default:"默认" }}</td>
+        <td>{{ entry.product|default:"—" }}</td>
+        <td class="mono">{{ entry.api_url }}</td>
         <td class="mono">{{ entry.masked_token }}</td>
         <td class="mono">{% if entry.webhook_secret %}已配置{% else %}—{% endif %}</td>
         <td>{% if entry.enabled %}<span class="pill-yes">开</span>{% else %}<span class="pill-no">关</span>{% endif %}</td>
         <td class="muted">{{ entry.note|default:"—" }}</td>
         <td>
-          <a class="btn small" href="?edit={{ entry.prefix|urlencode }}#repo-form">编辑</a>
-          <form class="inline" method="post" onsubmit="return confirm('确认删除 {{ entry.prefix }} ？')">
+          <a class="btn small" href="?edit={{ entry.api_url|urlencode }}#repo-form">编辑</a>
+          <form class="inline" method="post" onsubmit="return confirm('确认删除 {{ entry.api_url }} ？')">
             {% csrf_token %}
             <input type="hidden" name="action" value="delete_repo">
-            <input type="hidden" name="prefix" value="{{ entry.prefix }}">
+            <input type="hidden" name="api_url" value="{{ entry.api_url }}">
             <button class="btn small danger" type="submit">删除</button>
           </form>
         </td>
@@ -77,25 +77,26 @@
     </tbody>
   </table>
   {% else %}
-  <div class="empty">还没有令牌配置 —— 点上方「＋ 新增前缀」添加一条，评审时按最长前缀匹配自动选用。</div>
+  <div class="empty">还没有令牌配置 —— 点上方「＋ 新增令牌」添加一条，评审时按最长 API 地址匹配自动选用。</div>
   {% endif %}
 
   {% if show_repo_form %}
   <div id="repo-form">
-    <div class="fieldset-title">{% if editing %}编辑前缀：<span class="mono">{{ editing.prefix }}</span>{% else %}新增 / 覆盖令牌{% endif %}</div>
+    <div class="fieldset-title">{% if editing %}编辑令牌：{% if editing.product %}{{ editing.product }} · {% endif %}<span class="mono">{{ editing.api_url }}</span>{% else %}新增 / 覆盖令牌{% endif %}</div>
     <form method="post">
       {% csrf_token %}
       <input type="hidden" name="action" value="save_repo">
       {% if editing %}<input type="hidden" name="entry_id" value="{{ editing.pk }}">{% endif %}
       <div class="grid cols-3">
         <div>
-          <label>仓库前缀 *</label>
-          <input type="text" name="prefix" value="{{ editing.prefix|default:'' }}" placeholder="backend/team-a">
-          <div class="hint">匹配 project path 前缀（忽略大小写，不区分段边界），如 tp / tp/ / tp/CNE 都能匹配 tp/CNEOSv2/NetF/...；多条命中时取前缀最长者。{% if editing %}修改前缀即重命名该条配置（不能与已有前缀重复）。{% endif %}</div>
+          <label>产品 *</label>
+          <input type="text" name="product" value="{{ editing.product|default:'' }}" placeholder="如 CNEOSv2、WAF、研发网，可随意填写">
+          <div class="hint">仅作展示标签，与匹配无关。{% if editing %}可随时修改。{% endif %}</div>
         </div>
         <div>
-          <label>API 地址</label>
-          <input type="text" name="api_url" value="{{ editing.api_url|default:'' }}" placeholder="留空使用默认 GitLab 地址">
+          <label>API 地址 *</label>
+          <input type="text" name="api_url" value="{{ editing.api_url|default:'' }}" placeholder="https://gitlab.example.com/tp/CNEOSv2/Engine/epi-5.">
+          <div class="hint">匹配依据：GitLab URL 前缀（忽略大小写，末尾 / 可省略）。真实仓库 https://gitlab.example.com/tp/CNEOSv2/Engine/epi-5.0 能被 …/tp、…/tp/CNEOSv、…/tp/CNEOSv2/Engine/epi-5. 中任意一条命中，多条命中时取地址最长的那条。各条目的 API 地址不能重复。</div>
         </div>
         <div>
           <label>访问令牌 {% if editing %}（留空保持不变）{% else %}*{% endif %}</label>
@@ -117,7 +118,7 @@
         </div>
       </div>
       <div style="margin-top:16px">
-        <button class="btn primary" type="submit">{% if editing %}保存修改{% else %}添加 / 更新前缀{% endif %}</button>
+        <button class="btn primary" type="submit">{% if editing %}保存修改{% else %}添加 / 更新令牌{% endif %}</button>
         <a class="btn" href="{% url 'reviewer:settings-repos' %}">取消</a>
       </div>
     </form>

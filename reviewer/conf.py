@@ -1,7 +1,7 @@
 """Environment-driven configuration for the GitLab MR review service.
 
 Config sources, in priority order:
-1. ``GITLABMR_REPO_CONFIG``  - path to a YAML/JSON file describing per-prefix repo tokens.
+1. ``GITLABMR_REPO_CONFIG``  - path to a YAML/JSON file describing per-repo tokens (match by URL prefix).
 2. ``GITLABMR_REPO_TOKENS``  - the same structure inlined as JSON in an env var.
 Plus plain env vars for the AI endpoint, webhook secret and tuning knobs (see README).
 """
@@ -54,25 +54,54 @@ def _env_list(name: str) -> list[str]:
 
 
 def normalize_prefix(value: str) -> str:
-    """Canonical form of a repo prefix / project path.
+    """Canonical form of a project path (repo-token match key).
 
-    Trimmed, no leading or trailing slashes, lower-case - so ``tp``, ``tp/`` and
-    ``TP`` are the same prefix, and a ``TP/CNEOSv2/...`` project path stays
+    Trimmed, no leading or trailing slashes, lower-case - so ``tp``,
+    ``tp/`` and ``TP`` compare equal and a ``TP/CNEOSv2/...`` project path stays
     comparable with any casing written in the config.
     """
     return str(value or "").strip().strip("/").lower()
 
 
+def normalize_match_url(value: str) -> str:
+    """Canonical form of a repo-token match URL (a full GitLab URL prefix).
+
+    Lower-cased end to end - the old prefix scheme was case-insensitive, and
+    GitLab's own API resolves project paths regardless of case - with trailing
+    slashes dropped: ``https://host/tp/CNE`` and ``https://host/tp/cne/`` both
+    normalise to ``https://host/tp/cne``. A scheme-less input with a hostname
+    is assumed https; a bare path with no hostname at all is unusable for
+    matching and normalises to "".
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = raw if "://" in raw else f"https://{raw}"
+    without_scheme = candidate.split("://", 1)[1]
+    scheme = candidate[: len(candidate) - len(without_scheme)]
+    head, slash, tail = without_scheme.partition("/")
+    head = head.strip("/").lower()
+    if not head:
+        return ""
+    host = head.split(":", 1)[0]
+    # a usable host has a dot (gitlab.example.com, 192.168.1.5) or is localhost;
+    # this rejects scheme-less junk like "https:" (from a bare "https://" input).
+    if "." not in host and not host.startswith("localhost"):
+        return ""
+    path = tail.rstrip("/").strip().lower()
+    return f"{scheme}{head}" + (f"/{path}" if (slash or path) else "")
+
+
+def match_url_origin(url: str) -> str:
+    """The ``scheme://host`` part of a match URL, for API access."""
+    return api_origin(url)
+
+
 def api_origin(url: str) -> str:
     """Reduce a configured GitLab address to ``scheme://host``.
 
-    The REST API always lives at ``<origin>/api/v4``, but repo-token entries
-    often carry a project/group *page* URL like ``https://host/WAF`` - a habit
-    imported from GitLab's project webhooks. Appending ``/api/v4`` to such a
-    path never reaches the API: GitLab's router falls through to the web UI and
-    answers with a sign-in HTML page, which then breaks every call. Only the
-    scheme://host part is meaningful for API access; a scheme-less input is
-    assumed https.
+    The REST API always lives at ``<origin>/api/v4``. Only the scheme://host
+    part is meaningful for API access; a scheme-less input is assumed https.
     """
     value = (url or "").strip() or "https://gitlab.com"
     parsed = urlparse(value if "://" in value else f"https://{value}")
@@ -83,11 +112,15 @@ def api_origin(url: str) -> str:
 
 @dataclass(frozen=True)
 class RepoToken:
-    """Credentials for one repo prefix (longest prefix wins)."""
+    """Credentials matched by GitLab URL prefix (longest URL wins)."""
 
-    prefix: str
-    api_url: str
-    token: str
+    # Full GitLab URL prefix used for matching, canonicalised by
+    # normalize_match_url ("" = this entry only serves api_url+token).
+    match_url: str
+    # Human-facing label; never used for matching.
+    product: str = ""
+    api_url: str = ""
+    token: str = ""
     webhook_secret: str | None = None
 
 
@@ -130,20 +163,28 @@ def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
     for entry in entries or []:
         if not isinstance(entry, dict):
             continue
-        prefix = normalize_prefix(entry.get("prefix", ""))
+        match_url_raw = str(entry.get("match_url", "")).strip()
+        if not match_url_raw:
+            # Legacy shape: a bare path prefix + the instance address.
+            prefix = normalize_prefix(entry.get("prefix", ""))
+            if prefix:
+                match_url_raw = f"{api_origin(entry.get('api_url', ''))}/{prefix}"
+        product = str(entry.get("product", "")).strip()
         token = str(entry.get("token", "")).strip()
-        if not prefix or not token:
+        match_url = normalize_match_url(match_url_raw)
+        if not match_url or not token:
             continue
         tokens.append(
             RepoToken(
-                prefix=prefix,
-                api_url=api_origin(entry.get("api_url", "")),
+                match_url=match_url,
+                product=product,
+                api_url=api_origin(entry.get("api_url", "")) or match_url_origin(match_url),
                 token=token,
                 webhook_secret=(str(entry["webhook_secret"]).strip() if entry.get("webhook_secret") else None),
             )
         )
-    # Longest prefix first so resolution is a simple linear scan.
-    return tuple(sorted(tokens, key=lambda t: len(t.prefix), reverse=True))
+    # Longest URL first so resolution is a simple linear scan.
+    return tuple(sorted(tokens, key=lambda t: len(t.match_url), reverse=True))
 
 
 def _load_repo_tokens() -> tuple[RepoToken, ...]:
@@ -254,22 +295,22 @@ def _apply_db_overrides(conf: Conf) -> Conf:
 
     if token_entries:
         db_tokens = []
-        fallback_url = updates.get("default_api_url") or conf.default_api_url
         for entry in token_entries:
-            prefix = normalize_prefix(entry.prefix)
-            if not prefix:  # a blank prefix would swallow every project path
-                logger.warning("skipping repo token entry %s: blank prefix", entry.pk)
+            match_url = normalize_match_url(entry.api_url)
+            if not match_url:  # nothing to match against - the entry can never fire
+                logger.warning("skipping repo token entry %s: blank match URL", entry.pk)
                 continue
             db_tokens.append(
                 RepoToken(
-                    prefix=prefix,
-                    api_url=api_origin(entry.api_url or fallback_url),
+                    match_url=match_url,
+                    product=(entry.product or "").strip(),
+                    api_url=match_url_origin(match_url),
                     token=entry.token,
                     webhook_secret=entry.webhook_secret or None,
                 )
             )
-        # Longest prefix first so resolution is a simple linear scan.
-        updates["repo_tokens"] = tuple(sorted(db_tokens, key=lambda t: len(t.prefix), reverse=True))
+        # Longest URL first so resolution is a simple linear scan.
+        updates["repo_tokens"] = tuple(sorted(db_tokens, key=lambda t: len(t.match_url), reverse=True))
     if not updates:
         return conf
     return replace(conf, **updates)

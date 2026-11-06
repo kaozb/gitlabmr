@@ -53,14 +53,15 @@ def get_executor() -> ThreadPoolExecutor:
     return _EXECUTOR
 
 
-def submit_review(project_path: str, mr_iid: int, source: str = "webhook", force: bool = False) -> None:
-    get_executor().submit(_run_safe, project_path, mr_iid, source, force)
+def submit_review(project_path: str, mr_iid: int, source: str = "webhook", force: bool = False,
+                  host: str = "") -> None:
+    get_executor().submit(_run_safe, project_path, mr_iid, source, force, host)
 
 
-def _run_safe(project_path: str, mr_iid: int, source: str, force: bool) -> None:
+def _run_safe(project_path: str, mr_iid: int, source: str, force: bool, host: str = "") -> None:
     close_old_connections()
     try:
-        run_review(project_path, mr_iid, source, force=force)
+        run_review(project_path, mr_iid, source, force=force, host=host)
     except Exception:  # worker must never die silently
         logger.exception("review pipeline crashed for %s!%s", project_path, mr_iid)
     finally:
@@ -121,23 +122,24 @@ class StepTracker:
         record.save(update_fields=["steps", "updated_at"])
 
 
-def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: bool = False) -> None:
+def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: bool = False,
+               host: str = "") -> None:
     conf = get_conf()
     tracker = StepTracker()
 
     # -- stage 1: token
     tracker.start("token")
-    repo = resolve_repo_token(conf, project_path)
+    repo = resolve_repo_token(conf, project_path, host)
     if repo is None:
         tracker.fail("token", f"没有匹配项目 `{project_path}` 的令牌配置，也未配置默认令牌")
         _record_early_failure(project_path, mr_iid, source, "no_token", "没有匹配该项目的令牌配置", tracker)
         logger.warning("no token configured for project %s; review aborted", project_path)
         return
     masked = f"{repo.token[:4]}****{repo.token[-4:]}" if repo.token else "(empty)"
-    tracker.done("token", f"命中前缀 `{repo.prefix or '(默认)'}`，令牌 {masked}")
+    tracker.done("token", f"命中令牌配置「{repo.product or '默认'}」（{repo.match_url or '默认地址'}），令牌 {masked}")
 
-    # same fallback the dashboard uses for the host check: a prefix entry may
-    # leave api_url empty, in which case the default GitLab address applies.
+    # same fallback the dashboard uses for the host check: a URL entry already
+    # carries its own origin, but the default token path may leave it empty.
     client = GitLabClient(repo.api_url or conf.default_api_url, repo.token, timeout=conf.gitlab_timeout)
 
     # -- stage 2: read MR
@@ -283,6 +285,20 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             )
 
         summary_issues = [i for n, i in enumerate(review.key_issues_to_review) if n not in inline_published]
+        # keep the summary-only issues on the record so the detail page can list
+        # them alongside the reviewed/not-reviewed file panels
+        record.non_inline_issues = [
+            {
+                "relevant_file": i.relevant_file,
+                "start_line": i.start_line,
+                "end_line": i.end_line,
+                "issue_header": i.issue_header,
+                "issue_content": i.issue_content,
+                "kind": i.kind,
+                "evidence": i.evidence,
+            }
+            for i in summary_issues
+        ]
         body = render_review(
             _with_issues(review, summary_issues),
             mr_url=mr.get("web_url", ""),

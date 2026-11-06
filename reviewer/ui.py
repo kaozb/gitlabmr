@@ -6,7 +6,8 @@ Pages:
 - ``/settings/repos/`` GitLab connection defaults + per-prefix repo tokens
 - ``/reviews/<pk>/``          one review attempt in full detail (pipeline flowchart)
 - ``/reviews/<pk>/retry/``    force re-run of that review
-- ``/login/``, ``/logout/``   session gate, enabled by GITLABMR_UI_PASSWORD
+- ``/login/``, ``/logout/``   密码后备通道（GITLABMR_UI_PASSWORD，应急用）；
+- ``/work-weixin/*``         企微扫码/免密登录（主通道，见 wework.py）
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from __future__ import annotations
 import hmac
 import os
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from django.contrib import messages
 from django.db.models import Count
@@ -22,7 +23,7 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
-from .conf import MAX_INLINE_COMMENTS, get_conf, normalize_prefix, reload_conf
+from .conf import MAX_INLINE_COMMENTS, get_conf, normalize_match_url, reload_conf
 from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
 from .services.mrref import MRRefError, parse_mr_ref
 from .services.pipeline import submit_review
@@ -70,12 +71,12 @@ REPO_SETTING_GROUPS = [
     ("GitLab 连接", "webhook 地址、全局验签密钥、默认令牌", (
         ("webhook_secret", "Webhook 验签密钥", "text",
          "GitLab Webhook 的 Secret token，各仓库也可在下方单独配置；留空 = 不验签（仅建议内网）"),
-        ("default_api_url", "默认 GitLab 地址", "text", "如 https://gitlab.com，仓库未单独配置 api_url 时使用"),
-        ("default_token", "默认访问令牌", "password", "未命中任何前缀时兜底；留空则未知仓库将被忽略"),
+        ("default_api_url", "默认 GitLab 地址", "text", "如 https://gitlab.com；也作为默认令牌的匹配地址"),
+        ("default_token", "默认访问令牌", "password", "没有 API 地址命中时兜底；留空则未知仓库将被忽略"),
     )),
 ]
 
-REPO_FORM_FIELDS = ("prefix", "api_url", "token", "webhook_secret", "note")
+REPO_FORM_FIELDS = ("product", "api_url", "token", "webhook_secret", "note")
 
 
 def ui_password() -> str:
@@ -91,10 +92,18 @@ def mask_secret(value: str) -> str:
 
 
 def ui_login_required(view):
+    """全站登录保护：默认一律要求登录，未登录跳企微登录入口。
+
+    企业微信登录为主通道（见 wework.py）；密码登录是后备通道，
+    设置了 GITLABMR_UI_PASSWORD 才可用。登录流程三个路由
+    （/work-weixin/login/、/work-weixin/oauth-callback、/login/）
+    不挂本装饰器，业务路由一律要求登录。
+    """
+
     @wraps(view)
     def wrapper(request, *args, **kwargs):
-        if ui_password() and not request.session.get("ui_authed"):
-            return redirect(f"/login/?next={request.get_full_path()}")
+        if not request.session.get("ui_authed"):
+            return redirect(f"/work-weixin/login/?next={quote(request.get_full_path(), safe='')}")
         return view(request, *args, **kwargs)
 
     return wrapper
@@ -104,13 +113,17 @@ def _base_ctx(request, **extra):
     ctx = {
         "ui_password_set": bool(ui_password()),
         "ui_authed": bool(request.session.get("ui_authed")),
+        "wework_userid": request.session.get("wework_userid", ""),
     }
     ctx.update(extra)
     return ctx
 
 
 def _safe_next(request) -> str:
+    """登录后回跳目标：只接受站内绝对路径，防开放重定向。"""
     candidate = request.POST.get("next") or request.GET.get("next") or "/"
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
     if not url_has_allowed_host_and_scheme(candidate, allowed_hosts={request.get_host()}):
         return "/"
     return candidate
@@ -120,23 +133,28 @@ def _safe_next(request) -> str:
 
 
 def ui_login(request):
-    if not ui_password():
-        request.session["ui_authed"] = True  # no password configured: console stays open
-        return redirect("/")
+    """密码后备登录通道。
+
+    只有设置了 GITLABMR_UI_PASSWORD 才开放密码校验（应急用，
+    比如企微中转服务故障时）；主通道始终是 /work-weixin/login/。
+    未设置密码时本页只显示企微登录入口，不放行任何请求。
+    """
     next_url = _safe_next(request)
     if request.method == "POST":
-        password = request.POST.get("password", "")
-        if hmac.compare_digest(password.encode("utf-8"), ui_password().encode("utf-8")):
+        if not ui_password():
+            messages.error(request, "未设置 GITLABMR_UI_PASSWORD，密码登录不可用，请使用企业微信扫码登录")
+        elif hmac.compare_digest(request.POST.get("password", "").encode("utf-8"), ui_password().encode("utf-8")):
             request.session["ui_authed"] = True
             return redirect(next_url)
-        messages.error(request, "密码错误，请重试")
+        else:
+            messages.error(request, "密码错误，请重试")
     return render(request, "reviewer/login.html", _base_ctx(request, next=next_url))
 
 
 @require_POST
 def ui_logout(request):
-    request.session.pop("ui_authed", None)
-    return redirect("/login/")
+    request.session.flush()
+    return redirect(f"/login/?next={quote(_safe_next(request), safe='')}")
 
 
 # ------------------------------------------------------------------ dashboard
@@ -223,11 +241,11 @@ def trigger_review(request):
         return redirect("/")
 
     conf = get_conf()
-    repo = resolve_repo_token(conf, ref.project_path)
+    repo = resolve_repo_token(conf, ref.project_path, ref.host)
     if repo is None:
         messages.error(
             request,
-            f"{ref.project_path} 未匹配到任何令牌，请先在「仓库令牌」中添加能覆盖该路径的前缀（或默认令牌）",
+            f"{ref.project_path} 未匹配到任何令牌，请先在「仓库令牌」中添加能覆盖该仓库的 API 地址（或默认令牌）",
         )
         return redirect("/")
 
@@ -237,8 +255,8 @@ def trigger_review(request):
     if ref.host and api_host and ref.host != api_host:
         messages.error(
             request,
-            f"链接域名 {ref.host} 与令牌 {repo.prefix or '(默认)'} 的 GitLab 地址 "
-            f"{repo.api_url or conf.default_api_url} 不一致；请检查「仓库令牌」里的 api_url",
+            f"链接域名 {ref.host} 与令牌「{repo.product or '默认'}」的 GitLab 地址 "
+            f"{repo.api_url or conf.default_api_url} 不一致；请检查「仓库令牌」里的 API 地址",
         )
         return redirect("/")
 
@@ -250,7 +268,27 @@ def trigger_review(request):
 @ui_login_required
 def review_detail(request, pk):
     record = get_object_or_404(ReviewRecord, pk=pk)
-    return render(request, "reviewer/review_detail.html", _base_ctx(request, record=record))
+    # non-inline issues: file + summary lines for the detail page panel
+    non_inline_issues = [
+        {
+            "relevant_file": issue.get("relevant_file", ""),
+            "location": (
+                f"L{issue.get('start_line', '?')}-L{issue.get('end_line', '?')}"
+                if issue.get("start_line") and issue.get("end_line")
+                else ""
+            ),
+            "issue_header": issue.get("issue_header", ""),
+            "issue_content": issue.get("issue_content", ""),
+            "kind": issue.get("kind", ""),
+            "evidence": issue.get("evidence", ""),
+        }
+        for issue in (record.non_inline_issues or [])
+    ]
+    return render(
+        request,
+        "reviewer/review_detail.html",
+        _base_ctx(request, record=record, non_inline_issues=non_inline_issues),
+    )
 
 
 @ui_login_required
@@ -340,21 +378,21 @@ def settings_repos_view(request):
         if action == "save_repo":
             return _save_repo_token(request)
         if action == "delete_repo":
-            prefix = normalize_prefix(request.POST.get("prefix"))
-            deleted, _ = RepoTokenEntry.objects.filter(prefix=prefix).delete()
+            api_url = normalize_match_url(request.POST.get("api_url"))
+            deleted, _ = RepoTokenEntry.objects.filter(api_url=api_url).delete()
             reload_conf()
             if deleted:
-                messages.success(request, f"已删除令牌配置：{prefix}")
+                messages.success(request, f"已删除令牌配置：{api_url}")
             else:
-                messages.error(request, f"未找到令牌配置：{prefix}")
+                messages.error(request, f"未找到令牌配置：{api_url}")
             return redirect("reviewer:settings-repos")
         _apply_setting_post(request.POST, setting or Setting(), REPO_SETTING_GROUPS)
         reload_conf()
         messages.success(request, "GitLab 连接设置已保存并立即生效")
         return redirect("reviewer:settings-repos")
 
-    edit_prefix = normalize_prefix(request.GET.get("edit"))
-    editing = RepoTokenEntry.objects.filter(prefix=edit_prefix).first() if edit_prefix else None
+    edit_url = normalize_match_url(request.GET.get("edit"))
+    editing = RepoTokenEntry.objects.filter(api_url=edit_url).first() if edit_url else None
     # the add/edit form stays collapsed until the user asks for it ("编辑" / "新增")
     show_repo_form = editing is not None or request.GET.get("new") == "1"
     repo_entries = list(RepoTokenEntry.objects.all())
@@ -377,49 +415,42 @@ def settings_repos_view(request):
 
 
 def _save_repo_token(request):
-    prefix = normalize_prefix(request.POST.get("prefix"))
+    product = (request.POST.get("product") or "").strip()
+    raw_api_url = (request.POST.get("api_url") or "").strip().rstrip("/")
+    api_url = normalize_match_url(raw_api_url)
     token = (request.POST.get("token") or "").strip()
-    # 编辑态带 entry_id：按主键定位，因此允许直接改前缀（重命名）
+    # 编辑态带 entry_id：按主键定位，因此允许直接改产品名与匹配地址
     entry_id = (request.POST.get("entry_id") or "").strip()
     entry = RepoTokenEntry.objects.filter(pk=int(entry_id)).first() if entry_id.isdigit() else None
-    if entry is None and prefix:
-        entry = RepoTokenEntry.objects.filter(prefix=prefix).first()
-    if not prefix or " " in prefix:
-        messages.error(request, "前缀不能为空且不能包含空格，例如 backend/team-a")
+    if not api_url or " " in api_url:
+        messages.error(request, "API 地址不能为空且不能包含空格，例如 https://gitlab.example.com/tp/CNEOSv2")
         return redirect("reviewer:settings-repos")
     if entry is None and not token:
-        messages.error(request, f"新配置 {prefix} 必须填写访问令牌")
+        messages.error(request, f"新配置 {api_url} 必须填写访问令牌")
         return redirect("reviewer:settings-repos")
-    if entry is not None and entry.prefix != prefix:
-        conflict = RepoTokenEntry.objects.filter(prefix=prefix).exclude(pk=entry.pk).exists()
-        if conflict:
-            messages.error(request, f"前缀 {prefix} 已被其他配置占用，请换一个")
+    if entry is None:
+        if RepoTokenEntry.objects.filter(api_url=api_url).exists():
+            messages.error(request, f"API 地址 {api_url} 已被其他配置占用，请换一个")
             return redirect("reviewer:settings-repos")
-    from .conf import api_origin
-
-    raw_api_url = (request.POST.get("api_url") or "").strip().rstrip("/")
-    if raw_api_url and api_origin(raw_api_url) != raw_api_url:
-        messages.error(
-            request,
-            f"API 地址请填 GitLab 实例根地址（如 https://gitlab.example.com），不要带项目路径：{raw_api_url}"
-            f"（REST API 固定在 {api_origin(raw_api_url)}/api/v4，带路径会被路由到网页登录页）",
-        )
+    elif RepoTokenEntry.objects.filter(api_url=api_url).exclude(pk=entry.pk).exists():
+        messages.error(request, f"API 地址 {api_url} 已被其他配置占用，请换一个")
         return redirect("reviewer:settings-repos")
     fields = {
-        "api_url": raw_api_url,
+        "product": product,
         "webhook_secret": (request.POST.get("webhook_secret") or "").strip(),
         "note": (request.POST.get("note") or "").strip(),
         "enabled": request.POST.get("enabled") == "on",
     }
     if entry is None:
-        entry = RepoTokenEntry(prefix=prefix, token=token, **fields)
+        entry = RepoTokenEntry(api_url=api_url, token=token, **fields)
     else:
-        entry.prefix = prefix
+        entry.api_url = api_url
+        entry.product = product
         for name, value in fields.items():
             setattr(entry, name, value)
         if token:  # empty token on an existing entry = keep the stored one
             entry.token = token
     entry.save()
     reload_conf()
-    messages.success(request, f"已保存令牌配置：{prefix}（长前缀优先，立即生效）")
+    messages.success(request, f"已保存令牌配置：{product or api_url}（最长地址优先，立即生效）")
     return redirect("reviewer:settings-repos")

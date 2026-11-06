@@ -3,16 +3,29 @@
 <div class="login-wrap">
   <div class="card">
     <h1 style="text-align:center">GitLab MR AI 评审控制台</h1>
-    <p class="sub" style="text-align:center">请输入访问密码（环境变量 GITLABMR_UI_PASSWORD）</p>
-    <form method="post">
-      {% csrf_token %}
-      <input type="hidden" name="next" value="{{ next }}">
-      <label>访问密码</label>
-      <input type="password" name="password" autofocus autocomplete="current-password" required>
-      <div style="margin-top:16px">
-        <button class="btn primary" type="submit" style="width:100%">登录</button>
-      </div>
-    </form>
+    <p class="sub" style="text-align:center">推荐使用企业微信登录（PC 浏览器扫码 / 企微内免密授权）</p>
+    <div style="margin-top:16px">
+      <a class="btn primary" style="width:100%;display:block;text-align:center;box-sizing:border-box"
+         href="/work-weixin/login/?next={{ next|urlencode }}">企业微信登录</a>
+    </div>
+
+    {% if ui_password_set %}
+      <hr style="margin:20px 0;border:none;border-top:1px solid #eee">
+      <p class="sub" style="text-align:center">企业微信不可用时，可用访问密码登录（后备通道）</p>
+      <form method="post">
+        {% csrf_token %}
+        <input type="hidden" name="next" value="{{ next }}">
+        <label>访问密码（GITLABMR_UI_PASSWORD）</label>
+        <input type="password" name="password" autocomplete="current-password">
+        <div style="margin-top:16px">
+          <button class="btn" type="submit" style="width:100%">密码登录</button>
+        </div>
+      </form>
+    {% else %}
+      <p class="sub" style="text-align:center;margin-top:16px">
+        未设置 GITLABMR_UI_PASSWORD，密码登录通道关闭
+      </p>
+    {% endif %}
   </div>
 </div>
 {% endblock %}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from unittest.mock import MagicMock, patch
+from urllib.parse import quote
 
 from django.test import TestCase
 
@@ -38,6 +39,7 @@ from .services.render import (
     render_skip,
     truncate,
 )
+from .wework import REDIRECT_URI, STATE, WeWorkLoginError
 from .services.mrref import MRRefError, parse_mr_ref
 from .services.tokens import resolve_repo_token
 
@@ -57,8 +59,10 @@ def _conf(**overrides) -> Conf:
         default_api_url="https://gitlab.example.com",
         default_token="default-token",
         repo_tokens=(
-            RepoToken(prefix="backend", api_url="https://gitlab.example.com", token="tok-backend"),
-            RepoToken(prefix="backend/team-a", api_url="https://gitlab.example.com", token="tok-team-a"),
+            RepoToken(match_url="https://gitlab.example.com/backend", product="Backend",
+                      api_url="https://gitlab.example.com/backend", token="tok-backend"),
+            RepoToken(match_url="https://gitlab.example.com/backend/team-a", product="Team-A",
+                      api_url="https://gitlab.example.com/backend/team-a", token="tok-team-a"),
         ),
         llm_base_url="https://llm.example.com/v1",
         llm_api_key="llm-key",
@@ -136,62 +140,98 @@ class ApiOriginTests(TestCase):
 
     def test_config_layers_normalize_repo_and_default_urls(self):
         entry = RepoTokenEntry.objects.create(
-            prefix="waf", token="glpat-1", api_url="https://gl.example.com/WAF"
+            product="WAF", token="glpat-1", api_url="https://gl.example.com/WAF"
         )
         Setting.objects.create(default_api_url="https://gl.example.com/WAF")
         conf = reload_conf()
         self.assertEqual(conf.default_api_url, "https://gl.example.com")
         repo = resolve_repo_token(conf, "WAF/nextwaf/web_ui")
-        self.assertEqual(repo.prefix, "waf")
+        self.assertEqual(repo.match_url, "https://gl.example.com/waf")
         self.assertEqual(repo.api_url, "https://gl.example.com")
+        self.assertEqual(repo.token, "glpat-1")
         entry.delete()
 
 
 class TokenResolverTests(TestCase):
-    def test_longest_prefix_wins(self):
-        conf = _conf()
-        self.assertEqual(resolve_repo_token(conf, "backend/team-a/svc").token, "tok-team-a")
-        self.assertEqual(resolve_repo_token(conf, "backend/payments").token, "tok-backend")
+    def _repo(self, match_url, token, **kw):
+        return RepoToken(match_url=match_url, api_url=match_url, token=token, **kw)
 
-    def test_prefix_is_a_plain_case_insensitive_string_prefix(self):
-        # Not segment aware: `tp/cneos` must cover `tp/CNEOSv2/...`, and casing
-        # on either side must not matter.
+    def test_longest_url_wins(self):
         conf = _conf(
             default_token="",
             repo_tokens=(
-                RepoToken(prefix="tp/cneos", api_url="https://x", token="tok-cneos"),
+                self._repo("https://gitlab.example.com/tp", "tok-tp"),
+                self._repo("https://gitlab.example.com/tp/cneosv2", "tok-cneosv2"),
             ),
         )
-        for path in (
-            "tp/CNEOSv2/NetF/npp/npp.v2.0",
-            "TP/cneosv2/netf/npp/npp.v2.0",
-            "tp/cneos",
-            "tp/cneos/",
-        ):
-            self.assertEqual(resolve_repo_token(conf, path).token, "tok-cneos", path)
-
-    def test_prefix_forms_are_equivalent(self):
-        # tp, tp/ and TP/ all normalise to the same prefix.
-        for typed in ("tp", "tp/", "TP", "TP/", " tp/ "):
-            conf = _conf(default_token="", repo_tokens=(RepoToken(prefix=typed, api_url="https://x", token="tok-tp"),))
-            self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/NetF/npp").token, "tok-tp", typed)
-
-    def test_longest_match_wins_across_prefix_set(self):
-        conf = _conf(
-            default_token="",
-            repo_tokens=(
-                RepoToken(prefix="tp", api_url="https://x", token="tok-tp"),
-                RepoToken(prefix="tp/CNE", api_url="https://x", token="tok-cne"),
-                RepoToken(prefix="tp/cneosv2/netf/npp/", api_url="https://x", token="tok-npp"),
-            ),
-        )
-        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/NetF/npp/npp.v2.0").token, "tok-npp")
-        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/OS/kernel").token, "tok-cne")
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/Engine/epi-5.0").token, "tok-cneosv2")
         self.assertEqual(resolve_repo_token(conf, "tp/other/repo").token, "tok-tp")
 
+    def test_real_repo_matched_by_all_its_url_prefixes(self):
+        # https://gitlab.inone.nsfocus.com/tp/CNEOSv2/Engine/epi-5.0 is covered
+        # by every shorter URL prefix; the LONGEST entry's token must win.
+        base = "https://gitlab.inone.nsfocus.com"
+        host = "gitlab.inone.nsfocus.com"
+        conf = _conf(
+            default_token="",
+            repo_tokens=(
+                self._repo(f"{base}/tp", "tok-tp"),
+                self._repo(f"{base}/tp/CNEOSv", "tok-cneosv"),
+                self._repo(f"{base}/tp/CNEOSv2/Engin", "tok-engin"),
+                self._repo(f"{base}/tp/CNEOSv2/Engine/epi-5.", "tok-epi5"),
+            ),
+        )
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/Engine/epi-5.0", host=host).token, "tok-epi5")
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/Engine/other", host=host).token, "tok-engin")
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/OS/kernel", host=host).token, "tok-cneosv")
+        self.assertEqual(resolve_repo_token(conf, "tp/other", host=host).token, "tok-tp")
+
+    def test_entries_on_default_host_match_without_explicit_host(self):
+        # webhook paths carry no host: entries on the default GitLab address match.
+        conf = _conf(default_token="", repo_tokens=(self._repo("https://gitlab.example.com/tp/cneosv2", "tok"),))
+        self.assertEqual(resolve_repo_token(conf, "tp/CNEOSv2/Engine").token, "tok")
+        # ...but a project on another host does not
+        self.assertIsNone(resolve_repo_token(conf, "tp/CNEOSv2/Engine", host="gitlab.other.com"))
+
+    def test_match_uses_host_from_manual_link(self):
+        # A link from another instance must not fall back to the default token:
+        # that would silently send the review to the wrong GitLab host.
+        conf = _conf(
+            default_api_url="https://gitlab.example.com",
+            default_token="default-token",
+            repo_tokens=(self._repo("https://gitlab.example.com/tp/cneosv2", "tok-cneosv2"),),
+        )
+        self.assertIsNone(resolve_repo_token(conf, "tp/cneosv2/engine", host="gitlab.inone.nsfocus.com"))
+        repo = resolve_repo_token(conf, "tp/cneosv2/engine")
+        self.assertEqual(repo.token, "tok-cneosv2")
+        # api_url keeps the full match URL; the API client reduces it to the origin
+        self.assertEqual(repo.api_url, "https://gitlab.example.com/tp/cneosv2")
+
+    def test_default_fallback_requires_host_match(self):
+        conf = _conf(default_api_url="https://gitlab.example.com", repo_tokens=())
+        self.assertEqual(resolve_repo_token(conf, "anything/else").token, "default-token")
+        self.assertIsNone(resolve_repo_token(conf, "anything/else", host="other.example.com"))
+
     def test_default_fallback_and_none(self):
-        self.assertEqual(resolve_repo_token(_conf(), "anything/else").token, "default-token")
-        self.assertIsNone(resolve_repo_token(_conf(default_token=""), "anything/else"))
+        conf = _conf(repo_tokens=())
+        self.assertEqual(resolve_repo_token(conf, "anything/else").token, "default-token")
+        self.assertIsNone(resolve_repo_token(_conf(default_token="", repo_tokens=()), "anything/else"))
+
+    def test_legacy_prefix_config_key_maps_to_match_url(self):
+        # Old-style env/file entries written with a "prefix" key (path prefix +
+        # api_url) keep working: the parser recombines them into a match URL.
+        from .conf import _parse_repo_entries
+
+        entries = _parse_repo_entries([
+            {"prefix": "tp/cneos", "api_url": "https://gl.example.com", "token": "tok-cneos"},
+            {"product": "New", "match_url": "https://gl.example.com/tp", "token": "tok-tp"},
+        ])
+        self.assertEqual(entries[0].match_url, "https://gl.example.com/tp/cneos")
+        self.assertEqual(entries[0].token, "tok-cneos")
+        self.assertEqual(entries[1].match_url, "https://gl.example.com/tp")
+        self.assertEqual(entries[1].product, "New")
+        # longest URL first
+        self.assertEqual(len(entries[0].match_url), max(len(e.match_url) for e in entries))
 
 
 class DiffContextTests(TestCase):
@@ -565,10 +605,11 @@ class WebhookViewTests(TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _mr_payload(self, project="backend/payments", iid=7, action="open", title="Add feature", user="alice"):
+    def _mr_payload(self, project="backend/payments", iid=7, action="open", title="Add feature", user="alice",
+                    web_url=""):
         return {
             "object_kind": "merge_request",
-            "project": {"path_with_namespace": project},
+            "project": {"path_with_namespace": project, "web_url": web_url},
             "user": {"username": user},
             "object_attributes": {
                 "iid": iid,
@@ -609,13 +650,13 @@ class WebhookViewTests(TestCase):
         with patch("reviewer.views.get_conf", return_value=conf), patch("reviewer.views.submit_review") as submit:
             resp = self._post(self._mr_payload(project="any/repo"))
         self.assertEqual(resp.status_code, 200)
-        submit.assert_called_once_with("any/repo", 7, source="webhook")
+        submit.assert_called_once_with("any/repo", 7, source="webhook", host="")
 
     def test_open_triggers_review(self):
         with patch("reviewer.views.submit_review") as submit:
             resp = self._post(self._mr_payload())
         self.assertEqual(resp.status_code, 200)
-        submit.assert_called_once_with("backend/payments", 7, source="webhook")
+        submit.assert_called_once_with("backend/payments", 7, source="webhook", host="")
         self.assertEqual(WebhookEvent.objects.get().handled, "review")
 
     def test_push_triggers_when_enabled(self):
@@ -641,6 +682,22 @@ class WebhookViewTests(TestCase):
         event = WebhookEvent.objects.get()
         self.assertEqual((event.action, event.handled), ("open", "ignored"))
 
+    def test_match_uses_payload_web_url_host(self):
+        # Entries live on gitlab.example.com; a webhook whose payload reports
+        # another instance (project.web_url) must not match them.
+        conf = _conf(default_token="", repo_tokens=(
+            RepoToken(match_url="https://gitlab.example.com/backend", api_url="https://gitlab.example.com",
+                      token="tok-backend"),
+        ))
+        with patch("reviewer.views.get_conf", return_value=conf), \
+                patch("reviewer.views.submit_review") as submit:
+            self._post(self._mr_payload(web_url="https://gitlab.other.com/backend/payments"))
+            submit.assert_not_called()
+            # same project from the configured instance goes through
+            self._post(self._mr_payload(iid=8, web_url="https://GitLab.Example.com/backend/payments"))
+            submit.assert_called_once_with("backend/payments", 8, source="webhook",
+                                           host="gitlab.example.com")
+
     def test_only_first_open_event_recorded(self):
         with patch("reviewer.views.submit_review"):
             self._post(self._mr_payload())
@@ -659,11 +716,12 @@ class WebhookViewTests(TestCase):
         }
         with patch("reviewer.views.submit_review") as submit:
             self._post(payload)
-        submit.assert_called_once_with("backend/payments", 3, source="note")
+        submit.assert_called_once_with("backend/payments", 3, source="note", host="")
 
     def test_per_repo_secret_accepted(self):
         conf = _conf(repo_tokens=(
-            RepoToken(prefix="backend", api_url="https://x", token="t", webhook_secret="repo-secret"),
+            RepoToken(match_url="https://gitlab.example.com/backend", api_url="https://x", token="t",
+                      webhook_secret="repo-secret"),
         ))
         with patch("reviewer.views.get_conf", return_value=conf), patch("reviewer.views.submit_review"):
             resp = self.client.post(
@@ -706,6 +764,43 @@ class PipelineTests(TestCase):
         note_ids = iter([{"id": 55}, {"id": 66}, {"id": 77}])
         client.create_note.side_effect = lambda *a, **k: next(note_ids)
         return client
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_non_inline_issues_recorded_with_inline_enabled(self, client_cls, review_fn):
+        """Issues that stay in the summary (e.g. line outside the diff hunks)
+        must be persisted so the detail page can show the panel."""
+        client = self._client_mock()
+        # SAMPLE_PATCH only exposes new lines 1-3 and 11-12; the issue points at
+        # L5, a gap between hunks -> cannot go inline, falls back to the summary
+        client_cls.return_value = client
+        gap_yaml = GOOD_REVIEW_YAML.replace("start_line: 2", "start_line: 5").replace("end_line: 2", "end_line: 5")
+        review_fn.return_value = (parse_review(gap_yaml, num_max_findings=6), "test-model")
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(client.create_inline_discussion.call_count, 0)
+        self.assertEqual(len(record.non_inline_issues), 1)
+        issue = record.non_inline_issues[0]
+        self.assertEqual(issue["relevant_file"], "app.py")
+        self.assertEqual((issue["start_line"], issue["end_line"]), (5, 5))
+        self.assertEqual(issue["issue_header"], "Bug")
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_non_inline_issues_empty_when_published_inline(self, client_cls, review_fn):
+        client = self._client_mock()
+        client_cls.return_value = client
+        review_fn.return_value = (parse_review(GOOD_REVIEW_YAML, num_max_findings=6), "test-model")
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        client.create_inline_discussion.assert_called_once()
+        self.assertEqual(record.non_inline_issues, [])
 
     @patch("reviewer.services.pipeline.review_with_fallback")
     @patch("reviewer.services.pipeline.GitLabClient")
@@ -1025,17 +1120,20 @@ class ConfDbOverrideTests(TestCase):
             self.assertTrue(reload_conf().review_on_push)
 
     def test_db_repo_tokens_replace_env_ones(self):
+        Setting.objects.create(default_api_url="https://db.example.com")
         env = {"GITLABMR_GITLAB_TOKEN": "", "GITLABMR_WEBHOOK_SECRET": "",
                "GITLABMR_REPO_CONFIG": "", "GITLABMR_REPO_TOKENS": ""}
         with patch.dict(os.environ, env):
             reload_conf()
             self.assertEqual(get_conf().repo_tokens, ())
-            RepoTokenEntry.objects.create(prefix="Backend/Team", token="glpat-db", api_url="https://db.example.com")
+            RepoTokenEntry.objects.create(
+                product="Team", token="glpat-db", api_url="https://db.example.com/backend/team"
+            )
             conf = reload_conf()
             repo = resolve_repo_token(conf, "backend/team/svc")
             self.assertEqual(repo.token, "glpat-db")
             self.assertEqual(repo.api_url, "https://db.example.com")
-            self.assertEqual(repo.prefix, "backend/team")
+            self.assertEqual(repo.match_url, "https://db.example.com/backend/team")
             self.assertIsNone(resolve_repo_token(conf, "other/repo"))
             # disabled entries drop out of the table
             RepoTokenEntry.objects.update(enabled=False)
@@ -1077,23 +1175,107 @@ class ConfDbOverrideTests(TestCase):
 
 
 class UiAuthTests(TestCase):
-    def test_open_access_without_password(self):
-        with patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": ""}):
-            self.assertEqual(self.client.get("/").status_code, 200)
-            self.assertEqual(self.client.get("/settings/llm/").status_code, 200)
-            self.assertEqual(self.client.get("/settings/repos/").status_code, 200)
+    """访问策略：企微登录强制，密码为后备通道；webhook 与 /health/ 公开。"""
 
-    def test_login_flow(self):
+    def _authed(self):
+        session = self.client.session
+        session["ui_authed"] = True
+        session["wework_userid"] = "tester"
+        session.save()
+
+    # ---- 未登录一律 302 到企微登录入口 ----
+
+    def test_all_pages_require_login(self):
+        for url in ("/", "/settings/llm/", "/settings/repos/", "/webhooks/"):
+            resp = self.client.get(url)
+            self.assertEqual(resp.status_code, 302, url)
+            self.assertEqual(resp["Location"], f"/work-weixin/login/?next={quote(url, safe='')}", url)
+
+    def test_public_routes_bypass_login(self):
+        # GitLab webhook 必须保持公网可达，否则评审链路中断
+        self.assertEqual(self.client.get("/health/").status_code, 200)
+        resp = self.client.post(
+            "/tech_powered/code_review",
+            data=json.dumps({"object_kind": "push"}),
+            content_type="application/json",
+            HTTP_X_GITLAB_TOKEN="whsec",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    # ---- 登录流程三路由豁免 ----
+
+    def test_login_routes_open(self):
+        self.assertEqual(self.client.get("/work-weixin/login/").status_code, 302)  # → 企微授权页
+        self.assertEqual(self.client.get("/login/").status_code, 200)  # 密码后备页
+
+    # ---- 企微授权链接与回调 ----
+
+    def test_wework_login_redirect_url_encoded(self):
+        resp = self.client.get("/work-weixin/login/", {"next": "/settings/llm/"})
+        self.assertEqual(resp.status_code, 302)
+        location = resp["Location"]
+        self.assertTrue(location.startswith("http://login.work.weixin.qq.com/wwlogin/sso/login?"))
+        self.assertIn("login_type=CorpApp", location)
+        self.assertIn("appid=wxa2938475051e2e83", location)
+        self.assertIn("agentid=1000188", location)
+        self.assertIn("state=auth_state", location)
+        # redirect_uri 已 URL 编码
+        self.assertIn(f"redirect_uri={quote(REDIRECT_URI, safe='')}", location)
+        # next 存 cookie（state 被网关固定，不能携带自定义数据）
+        self.assertIn("wework_next", resp.cookies)
+        self.assertEqual(resp.cookies["wework_next"].value, "/settings/llm/")
+
+    def test_callback_bad_state_rejected(self):
+        resp = self.client.get("/work-weixin/oauth-callback", {"state": "wrong", "code": "x"})
+        self.assertEqual(resp.status_code, 403)
+
+    def test_callback_exchange_failure_502(self):
+        with patch("reviewer.wework.exchange_userid", side_effect=WeWorkLoginError("boom")):
+            resp = self.client.get("/work-weixin/oauth-callback", {"state": STATE, "code": "bad"})
+        self.assertEqual(resp.status_code, 502)
+
+    def test_callback_success_establishes_session(self):
+        with patch("reviewer.wework.exchange_userid", return_value="zhangsan") as exchange:
+            resp = self.client.get("/work-weixin/oauth-callback", {"state": STATE, "code": "good"})
+        exchange.assert_called_once_with("good")
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp["Location"], "/")
+        self.assertEqual(self.client.get("/").status_code, 200)  # 会话已建立
+        self.assertEqual(self.client.session["wework_userid"], "zhangsan")
+
+    def test_callback_next_from_cookie_with_open_redirect_guard(self):
+        self.client.cookies["wework_next"] = "//evil.example.com"
+        with patch("reviewer.wework.exchange_userid", return_value="u"):
+            resp = self.client.get("/work-weixin/oauth-callback", {"state": STATE, "code": "c"})
+        self.assertEqual(resp["Location"], "/")  # 非站内路径回落到 /
+        # 合法站内路径正常回跳
+        self.client.cookies["wework_next"] = "/settings/repos/"
+        with patch("reviewer.wework.exchange_userid", return_value="u"):
+            resp = self.client.get("/work-weixin/oauth-callback", {"state": STATE, "code": "c"})
+        self.assertEqual(resp["Location"], "/settings/repos/")
+
+    # ---- 密码后备通道 ----
+
+    def test_password_login_disabled_without_env(self):
+        with patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": ""}):
+            resp = self.client.post("/login/", {"password": "x", "next": "/"})
+            self.assertEqual(resp.status_code, 200)  # 渲染错误提示，不放行
+            self.assertEqual(self.client.get("/")["Location"], "/work-weixin/login/?next=%2F")
+
+    def test_password_login_flow(self):
         with patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": "secret123"}):
-            resp = self.client.get("/")
-            self.assertRedirects(resp, "/login/?next=/")
             self.assertContains(self.client.get("/login/"), "访问密码")
             resp = self.client.post("/login/", {"password": "wrong", "next": "/"})
             self.assertEqual(resp.status_code, 200)  # re-renders with error
             self.assertRedirects(self.client.post("/login/", {"password": "secret123", "next": "/"}), "/")
             self.assertEqual(self.client.get("/").status_code, 200)
-            self.assertRedirects(self.client.post("/logout/"), "/login/")
-            self.assertRedirects(self.client.get("/"), "/login/?next=/")
+
+    def test_logout(self):
+        self._authed()
+        self.assertEqual(self.client.get("/").status_code, 200)
+        resp = self.client.post("/logout/", {"next": "/settings/llm/"})
+        self.assertEqual(resp["Location"], "/login/?next=%2Fsettings%2Fllm%2F")
+        self.assertEqual(self.client.get("/")["Location"], "/work-weixin/login/?next=%2F")
 
     def test_open_redirect_blocked(self):
         with patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": "p"}):
@@ -1139,6 +1321,11 @@ class DashboardTests(TestCase):
         patcher = patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": ""})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 新访问策略：全站强制登录，直接用会话模拟已登录用户
+        session = self.client.session
+        session["ui_authed"] = True
+        session["wework_userid"] = "tester"
+        session.save()
 
     def _record(self, **kw):
         defaults = dict(
@@ -1215,6 +1402,21 @@ class DashboardTests(TestCase):
             self.client.post(f"/reviews/{record.pk}/retry/")
         submit.assert_called_once_with("backend/payments", 7, source="manual", force=True)
 
+    def test_detail_shows_non_inline_issues(self):
+        """The detail page lists the review issues that did not go inline."""
+        record = self._record(non_inline_issues=[{
+            "relevant_file": "app.py", "start_line": 2, "end_line": 2,
+            "issue_header": "Bug", "issue_content": "bad thing", "kind": "verified",
+            "evidence": "app.py:2 uses x",
+        }])
+        resp = self.client.get(f"/reviews/{record.pk}/")
+        self.assertContains(resp, "非行内评审意见")
+        self.assertContains(resp, "Bug")
+        self.assertContains(resp, "bad thing")
+        self.assertContains(resp, "app.py L2-L2")
+        self.assertContains(resp, "verified")
+        self.assertContains(resp, "app.py:2 uses x")
+
     def test_detail_shows_skip_reason(self):
         record = self._record(status="skipped", error_detail="no reviewable files")
         resp = self.client.get(f"/reviews/{record.pk}/")
@@ -1235,6 +1437,11 @@ class SettingsViewTests(TestCase):
                                           "GITLABMR_LLM_API_KEY": "env-key", "GITLABMR_WEBHOOK_SECRET": ""})
         patcher.start()
         self.addCleanup(patcher.stop)
+        Setting.objects.create(default_api_url="https://gitlab.example.com")
+        session = self.client.session
+        session["ui_authed"] = True
+        session["wework_userid"] = "tester"
+        session.save()
 
     def tearDown(self):
         _clear_db_config()
@@ -1271,82 +1478,112 @@ class SettingsViewTests(TestCase):
         self.assertEqual(conf.llm_api_key, "sk-2")
 
     def test_repo_form_collapsed_until_requested(self):
-        RepoTokenEntry.objects.create(prefix="backend/team", token="glpat-db")
+        RepoTokenEntry.objects.create(product="Team", token="glpat-db", api_url="https://gl.example.com/backend/team")
         # plain page: only the table + an "add" entry point, no add/edit form
         resp = self.client.get("/settings/repos/")
-        self.assertContains(resp, "多仓库前缀令牌")
-        self.assertContains(resp, "新增前缀")
+        self.assertContains(resp, "多仓库令牌")
+        self.assertContains(resp, "新增令牌")
         self.assertNotContains(resp, 'id="repo-form"')
         self.assertNotContains(resp, "用途说明")  # field unique to the add/edit form
-        # "编辑" opens the form, prefilled from the stored entry; prefix stays editable (rename)
-        resp = self.client.get("/settings/repos/?edit=backend/team")
+        # "编辑" opens the form, prefilled from the stored entry
+        resp = self.client.get("/settings/repos/?edit=https%3A%2F%2Fgl.example.com%2Fbackend%2Fteam")
         self.assertContains(resp, 'id="repo-form"')
-        self.assertContains(resp, 'name="prefix" value="backend/team"')
-        self.assertNotContains(resp, "readonly")
+        self.assertContains(resp, 'name="product" value="Team"')
+        self.assertContains(resp, 'name="api_url" value="https://gl.example.com/backend/team"')
         self.assertContains(resp, 'name="entry_id" value="')
         self.assertContains(resp, "保存修改")
-        self.assertNotContains(resp, "新增前缀")
-        # "新增" opens the same form empty, prefix editable
+        self.assertNotContains(resp, "新增令牌")
+        # "新增" opens the same form empty
         resp = self.client.get("/settings/repos/?new=1")
         self.assertContains(resp, 'id="repo-form"')
-        self.assertContains(resp, 'name="prefix" value=""')
-        self.assertNotContains(resp, "readonly")
-        self.assertContains(resp, "添加 / 更新前缀")
+        self.assertContains(resp, 'name="product" value=""')
+        self.assertContains(resp, "添加 / 更新令牌")
 
-    def test_repo_token_add_rejects_project_page_url(self):
-        # 把项目页面地址当成 API 地址保存是这次事故的根源，必须在入口拦住
-        resp = self.client.post("/settings/repos/", {
-            "action": "save_repo", "prefix": "waf", "token": "glpat-1",
-            "api_url": "https://gl.example.com/WAF", "enabled": "on",
-        })
-        self.assertRedirects(resp, "/settings/repos/")
+    def test_repo_token_add_rejects_non_url(self):
+        # 没有域名的纯路径/随意文本没有匹配意义，必须在入口拦住
+        for bad in ("waf", "backend/team", "https://", "/only/path"):
+            resp = self.client.post("/settings/repos/", {
+                "action": "save_repo", "product": "waf", "token": "glpat-1",
+                "api_url": bad, "enabled": "on",
+            })
+            self.assertRedirects(resp, "/settings/repos/", msg_prefix=bad)
         self.assertEqual(RepoTokenEntry.objects.count(), 0)  # nothing was saved
 
     def test_repo_token_add_update_delete(self):
         resp = self.client.post("/settings/repos/", {
-            "action": "save_repo", "prefix": "Backend/Team", "token": "glpat-1",
-            "api_url": "https://gl.example.com/", "webhook_secret": "", "note": "team repo", "enabled": "on",
+            "action": "save_repo", "product": "Team", "token": "glpat-1",
+            "api_url": "https://gitlab.example.com/backend/team/", "webhook_secret": "", "note": "team repo",
+            "enabled": "on",
         })
         self.assertRedirects(resp, "/settings/repos/")
         entry = RepoTokenEntry.objects.get()
-        self.assertEqual((entry.prefix, entry.token, entry.api_url), ("backend/team", "glpat-1", "https://gl.example.com"))
+        # trailing "/" normalised away; the URL prefix is stored verbatim
+        self.assertEqual((entry.product, entry.token, entry.api_url),
+                         ("Team", "glpat-1", "https://gitlab.example.com/backend/team"))
         repo = resolve_repo_token(reload_conf(), "backend/team/svc")
         self.assertEqual(repo.token, "glpat-1")
-        # update same prefix, blank token keeps stored one
-        self.client.post("/settings/repos/", {"action": "save_repo", "prefix": "backend/team", "token": "",
-                                              "api_url": "https://other.example.com", "enabled": "on"})
+        self.assertEqual(repo.api_url, "https://gitlab.example.com")
+        # update same entry, blank token keeps stored one
+        self.client.post("/settings/repos/", {"action": "save_repo", "entry_id": str(entry.pk), "product": "Team-2",
+                                              "token": "", "api_url": "https://gitlab.example.com/backend/team",
+                                              "enabled": "on"})
         entry.refresh_from_db()
-        self.assertEqual((entry.token, entry.api_url), ("glpat-1", "https://other.example.com"))
-        # new prefix requires a token
-        self.client.post("/settings/repos/", {"action": "save_repo", "prefix": "new/prefix", "token": ""})
+        self.assertEqual((entry.token, entry.api_url, entry.product),
+                         ("glpat-1", "https://gitlab.example.com/backend/team", "Team-2"))
+        # new entry requires a token
+        self.client.post("/settings/repos/", {"action": "save_repo", "product": "New",
+                                              "api_url": "https://gitlab.example.com/new", "token": ""})
         self.assertEqual(RepoTokenEntry.objects.count(), 1)
         # delete
-        self.client.post("/settings/repos/", {"action": "delete_repo", "prefix": "backend/team"})
+        self.client.post("/settings/repos/", {"action": "delete_repo",
+                                              "api_url": "https://gitlab.example.com/backend/team"})
         self.assertEqual(RepoTokenEntry.objects.count(), 0)
         self.assertEqual(resolve_repo_token(reload_conf(), "backend/team/svc"), None)
 
-    def test_repo_token_rename_by_id(self):
-        entry = RepoTokenEntry.objects.create(prefix="backend/team", token="glpat-1", api_url="https://a.example.com")
-        # 编辑态按主键更新：改前缀 = 重命名，令牌留空保持不变
+    def test_repo_token_add_duplicate_url_rejected(self):
+        RepoTokenEntry.objects.create(product="A", token="glpat-1", api_url="https://a.example.com/tp")
         resp = self.client.post("/settings/repos/", {
-            "action": "save_repo", "entry_id": str(entry.pk), "prefix": "Backend/Team-A", "token": "",
-            "api_url": "https://a.example.com", "enabled": "on",
+            "action": "save_repo", "product": "B", "token": "glpat-2",
+            "api_url": "https://A.example.com/tp/", "enabled": "on",
+        })
+        self.assertRedirects(resp, "/settings/repos/")
+        # 归一化后同地址：拒绝保存（大小写与末尾 / 都不产生第二条）
+        self.assertEqual(RepoTokenEntry.objects.count(), 1)
+
+    def test_repo_token_edit_by_id(self):
+        Setting.objects.update(default_api_url="https://a.example.com")  # setUp 已建行
+        entry = RepoTokenEntry.objects.create(
+            product="Team", token="glpat-1", api_url="https://a.example.com/backend/team"
+        )
+        # 编辑态按主键更新：改产品名/匹配地址都允许，令牌留空保持不变
+        resp = self.client.post("/settings/repos/", {
+            "action": "save_repo", "entry_id": str(entry.pk), "product": "Team-A",
+            "token": "", "api_url": "https://a.example.com/backend/team-a", "enabled": "on",
         })
         self.assertRedirects(resp, "/settings/repos/")
         self.assertEqual(RepoTokenEntry.objects.count(), 1)
         entry.refresh_from_db()
-        self.assertEqual((entry.prefix, entry.token), ("backend/team-a", "glpat-1"))
+        self.assertEqual((entry.product, entry.token), ("Team-A", "glpat-1"))
+        self.assertEqual(entry.api_url, "https://a.example.com/backend/team-a")
         conf = reload_conf()
         self.assertEqual(resolve_repo_token(conf, "backend/team-a/svc").token, "glpat-1")
         self.assertIsNone(resolve_repo_token(conf, "backend/team/svc"))
 
-    def test_repo_token_rename_conflict_rejected(self):
-        a = RepoTokenEntry.objects.create(prefix="backend/team", token="glpat-1")
-        RepoTokenEntry.objects.create(prefix="backend/other", token="glpat-2")
+    def test_repo_token_edit_url_conflict_rejected(self):
+        a = RepoTokenEntry.objects.create(product="A", token="glpat-1", api_url="https://a.example.com/one")
+        RepoTokenEntry.objects.create(product="B", token="glpat-2", api_url="https://a.example.com/two")
         self.client.post("/settings/repos/", {
-            "action": "save_repo", "entry_id": str(a.pk), "prefix": "backend/other", "token": "", "enabled": "on",
+            "action": "save_repo", "entry_id": str(a.pk), "product": "A",
+            "api_url": "https://a.example.com/two", "token": "", "enabled": "on",
         })
         a.refresh_from_db()
-        self.assertEqual(a.prefix, "backend/team")  # 冲突时不改名
+        self.assertEqual(a.api_url, "https://a.example.com/one")  # 冲突时不改地址
         self.assertEqual(RepoTokenEntry.objects.count(), 2)
         self.assertEqual(a.token, "glpat-1")  # 令牌也不会被覆盖
+
+    def test_repo_token_api_url_required(self):
+        resp = self.client.post("/settings/repos/", {
+            "action": "save_repo", "product": "X", "token": "glpat-1", "api_url": "", "enabled": "on",
+        })
+        self.assertRedirects(resp, "/settings/repos/")
+        self.assertEqual(RepoTokenEntry.objects.count(), 0)

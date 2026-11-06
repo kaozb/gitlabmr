@@ -35,8 +35,8 @@
   {% if reviews %}
   <table>
     <thead>
-      <tr><th>时间</th><th>项目 / MR</th><th>状态</th><th>评分</th><th>风险</th><th>问题</th>
-          <th>模型</th><th>耗时</th><th>来源</th><th>操作</th></tr>
+      <tr><th>时间</th><th>项目 / MR</th><th>状态</th><th>评分</th><th>风险</th>
+          <th>耗时</th><th>操作</th></tr>
     </thead>
     <tbody>
       {% for r in reviews %}
@@ -50,10 +50,7 @@
         <td><span class="badge {{ r.status }}" {% if r.error_detail %}title="{{ r.error_detail }}"{% endif %}>{{ r.status }}</span></td>
         <td>{% if r.score %}{{ r.score }}{% else %}—{% endif %}</td>
         <td>{% if r.risk_level %}<span class="risk-{{ r.risk_level }}">{{ r.risk_level }}</span>{% else %}—{% endif %}</td>
-        <td>{{ r.issues_count }}</td>
-        <td class="mono">{{ r.model_used|default:"—" }}</td>
-        <td class="muted">{% if r.duration_ms %}{{ r.duration_ms }}ms{% else %}—{% endif %}</td>
-        <td class="muted">{{ r.source }}</td>
+        <td class="muted">{% if r.duration_ms %}{{ r.duration_ms|floatformat:1 }}s{% else %}—{% endif %}</td>
         <td>
           <a class="btn small" href="{% url 'reviewer:review-detail' r.pk %}">详情</a>
           <form class="inline" method="post" action="{% url 'reviewer:review-retry' r.pk %}"

@@ -1,7 +1,7 @@
 # GitLab MR AI 评审服务建设方案（gitlabmr）
 
 > 目标：参考 PR-Agent 的评审链路设计（见 [01-pr-agent-review-analysis.md](01-pr-agent-review-analysis.md)），从零实现一个 **Django 服务**：接收 GitLab Webhook 的 MR 事件 → 拉取 diff → AI 评审 → 结论回写 MR。
-> 硬性要求：**简洁高效、准确**；支持**多仓库按前缀自动匹配 API 令牌**；无外部中间件依赖，下载即可本地测试。
+> 硬性要求：**简洁高效、准确**；支持**多仓库按 GitLab URL 前缀自动匹配 API 令牌**；无外部中间件依赖，下载即可本地测试。
 
 ---
 
@@ -11,7 +11,7 @@
 
 1. 接收 `merge_request` webhook（open / reopen / update+oldrev 推送新提交）自动评审；评论 `/review` 手动触发。
 2. 评审结论回写：MR 总结评论（默认）+ 可选行内评论（定位到文件行号）。
-3. 多仓库：按 `project path` 前缀匹配 GitLab 令牌与实例地址，长前缀优先；未命中用默认令牌。
+3. 多仓库：按 GitLab URL 前缀匹配令牌与实例地址，最长地址优先；未命中用默认令牌。
 4. 结论可靠：结构化输出强校验、失败重试与模型回退、诚实标注"未覆盖文件"。
 5. 下载即测：`pip install -r requirements.txt && python manage.py migrate && python manage.py runserver`，用 curl 模拟 webhook 即可验证。
 
@@ -38,8 +38,8 @@ GitLab ──webhook──▶ Django view (POST /tech_powered/code_review/)
         ┌─────────────┼──────────────────────────┐
         ▼             ▼                          ▼
   TokenResolver   DiffBuilder               LLMClient
-  前缀→令牌/实例    /changes + 文件过滤         OpenAI 兼容
-  (最长前缀匹配)    hunk 行号化 + token 裁剪     YAML 输出
+  URL前缀→令牌/实例 /changes + 文件过滤         OpenAI 兼容
+  (最长地址匹配)    hunk 行号化 + token 裁剪     YAML 输出
         │             │                   解析/校验/重试/回退
         └─────────────┼──────────────────────────┘
                       ▼
@@ -60,8 +60,8 @@ GitLab ──webhook──▶ Django view (POST /tech_powered/code_review/)
 | 模块 | 职责 | 对应 PR-Agent 概念 |
 |---|---|---|
 | `views.py` | webhook 入口：验签、过滤、幂等、投递 | `servers/gitlab_webhook.py` |
-| `conf.py` | 环境变量/配置文件加载：仓库前缀令牌表、AI 参数 | Dynaconf settings |
-| `services/tokens.py` | 前缀→（api_url, token, webhook_secret）解析 | 请求级 settings 隔离 |
+| `conf.py` | 环境变量/配置文件加载：仓库令牌表（URL 前缀匹配）、AI 参数 | Dynaconf settings |
+| `services/tokens.py` | GitLab URL 前缀→（api_url, token, webhook_secret）解析，最长地址优先 | 请求级 settings 隔离 |
 | `services/gitlab.py` | 薄封装 REST API v4：MR/changes/notes/discussions/user | `gitlab_provider.py` |
 | `services/diffctx.py` | 变更过滤、hunk 行号化、token 预算裁剪、清单 | `pr_processing.py` + `git_patch_processing.py` |
 | `services/prompts.py` | system/user prompt、YAML schema 说明 | `pr_reviewer_prompts.toml` |
@@ -76,25 +76,23 @@ GitLab ──webhook──▶ Django view (POST /tech_powered/code_review/)
 
 ## 4. 关键设计决策
 
-### D1 多仓库前缀令牌（核心需求）
+### D1 多仓库令牌：按 GitLab URL 前缀匹配（核心需求）
 
 配置来源（优先级：YAML 文件 > 环境变量 JSON）：
 
 ```yaml
 # repo_tokens.yml（也可用环境变量 GITLABMR_REPO_TOKENS 传同样的 JSON）
-default:
-  api_url: https://gitlab.com
-  token: glpat-default
 repos:
-  - prefix: backend/            # project path 前缀，长前缀优先
-    api_url: https://gitlab.internal
-    token: glpat-backend
+  - match_url: https://gitlab.internal/tp/CNEOSv2   # 匹配依据：GitLab URL 前缀，最长者生效
+    product: CNEOSv2        # 仅作展示标签，与匹配无关
+    token: glpat-cneosv2
     webhook_secret: whsec-b1    # 可选，未配置则用全局 GITLABMR_WEBHOOK_SECRET
-  - prefix: backend/team-a/
-    token: glpat-team-a
+  - match_url: https://gitlab.internal/tp
+    token: glpat-tp
 ```
 
-- 解析规则：把所有前缀当成一个集合逐个对 `path_with_namespace` 做**忽略大小写**的字符串前缀匹配（前缀与路径都会先归一化：去首尾空白与 `/`、转小写）；命中项里**前缀最长**者胜出，无命中用 `default`；连 default 都没有该仓库 → 事件记 `skipped(no_token)`，不报错。
+- 解析规则：每条配置的 `match_url` 是一个完整 GitLab URL 前缀。目标仓库 URL（项目路径 + 默认 GitLab 域名，手动触发时优先用链接里的域名）与所有启用条目逐个比对，凡 `match_url` 是其前缀者皆命中，**地址最长者胜出**；无命中用「默认地址 + 默认令牌」（默认地址同样参与匹配，域名不同不兜底）；连默认令牌都没有 → 事件记 `ignored(no_token)`，不报错。
+- 归一化：整条 URL 忽略大小写（与旧版前缀匹配一致）、去末尾 `/`。
 - 每次评审把解析结果作为参数显式传递（**不用全局可变状态**），天然实现并发仓库隔离（PR-Agent 用请求级 deepcopy 达成同样目的）。
 
 ### D2 Webhook 安全与幂等

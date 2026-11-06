@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-一键探测所有 GitLab 多仓库前缀令牌的有效性
+一键探测所有 GitLab 多仓库令牌的有效性
 用法: python scripts/check_tokens.py
 """
 
@@ -13,9 +13,7 @@ from datetime import datetime
 # 数据库路径
 DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'gitlabmr.sqlite3')
 
-# 复用服务端的 GitLab 地址归一化：api_url 若被填成项目页面地址
-# （如 https://host/WAF），必须先归一到 scheme://host 再拼 /api/v4，
-# 否则请求会被 GitLab 路由到网页登录页，拿到 HTML 当 JSON 解析报错。
+# api_url 是完整匹配地址（可带项目路径），实际 API 调用只取 scheme://host。
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from reviewer.conf import api_origin
 
@@ -28,10 +26,10 @@ def get_tokens_from_db():
     
     # 查询所有 enabled=1 的记录
     cursor.execute("""
-        SELECT id, prefix, api_url, token, enabled
+        SELECT id, product, api_url, token, enabled
         FROM reviewer_repotokenentry
         WHERE enabled = 1
-        ORDER BY prefix
+        ORDER BY api_url
     """)
     
     rows = cursor.fetchall()
@@ -78,7 +76,7 @@ def check_token(token, api_url):
 
 def main():
     print("=" * 80)
-    print(f"GitLab 多仓库前缀令牌有效性探测")
+    print(f"GitLab 多仓库令牌有效性探测")
     print(f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 80)
     
@@ -100,12 +98,12 @@ def main():
     invalid_count = 0
     
     for idx, item in enumerate(tokens, 1):
-        prefix = item['prefix']
+        product = item['product']
         api_url = item['api_url']
         token = item['token']
         
-        print(f"[{idx}/{len(tokens)}] 前缀: {prefix}")
-        print(f"       API URL: {api_url}")
+        print(f"[{idx}/{len(tokens)}] 产品: {product or '(未填)'}")
+        print(f"       API 地址: {api_url}")
         print(f"       Token: {token[:8]}...{token[-4:]}" if len(token) > 12 else f"       Token: {token}")
         
         is_valid, message, user_info = check_token(token, api_url)
@@ -122,7 +120,7 @@ def main():
             print(f"       结果: {status_icon} {message}")
         
         results.append({
-            'prefix': prefix,
+            'product': product,
             'api_url': api_url,
             'token': token,
             'valid': is_valid,
@@ -146,7 +144,7 @@ def main():
         print("❌ 无效令牌列表:")
         for r in results:
             if not r['valid']:
-                print(f"  - {r['prefix']}: {r['message']}")
+                print(f"  - {r['product'] or r['api_url']}: {r['message']}")
         print()
     
     # 显示有效令牌详情
@@ -155,7 +153,7 @@ def main():
         for r in results:
             if r['valid']:
                 user = r['user_info']
-                print(f"  - {r['prefix']}: {user['name']} (@{user['username']})")
+                print(f"  - {r['product'] or r['api_url']}: {user['name']} (@{user['username']})")
         print()
     
     # 导出结果到文件
@@ -173,7 +171,7 @@ def main():
         f.write("-" * 80 + "\n\n")
         
         for r in results:
-            f.write(f"前缀: {r['prefix']}\n")
+            f.write(f"产品: {r['product']}\n")
             f.write(f"API URL: {r['api_url']}\n")
             f.write(f"Token: {r['token'][:4]}****{r['token'][-4:]}（已打码）\n")
             f.write(f"状态: {'✅ 有效' if r['valid'] else '❌ 无效'}\n")

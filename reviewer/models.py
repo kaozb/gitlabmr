@@ -50,6 +50,9 @@ class ReviewRecord(models.Model):
     risk_level = models.CharField(max_length=16, blank=True, default="")
     reviewed_files = models.JSONField(default=list, blank=True)
     not_reviewed_files = models.JSONField(default=list, blank=True)
+    # key issues that were NOT published as inline comments (summary-only ones):
+    # [{relevant_file, start_line, end_line, issue_header, issue_content, kind, evidence}]
+    non_inline_issues = models.JSONField(default=list, blank=True)
     diff_chars = models.IntegerField(default=0)
     prompt_chars = models.IntegerField(default=0)
     completion_chars = models.IntegerField(default=0)
@@ -111,14 +114,21 @@ class Setting(models.Model):
 
 
 class RepoTokenEntry(models.Model):
-    """Per-prefix GitLab credential managed from the dashboard.
+    """Per-repo GitLab credential managed from the dashboard.
 
-    When at least one enabled entry exists, these replace the tokens loaded
-    from env/file config entirely; otherwise env/file tokens are used.
+    ``api_url`` is the match key: a full GitLab URL prefix such as
+    ``https://gitlab.example.com/tp/CNEOSv`` - every enabled entry forms one
+    candidate set and the longest URL covering the target repo wins. When at
+    least one enabled entry exists, these replace the tokens loaded from
+    env/file config entirely; otherwise env/file tokens are used.
+
+    ``product`` is a free-form human label only (unique as the row identity);
+    it never participates in matching.
     """
 
-    prefix = models.CharField(max_length=256, unique=True)
-    api_url = models.CharField(max_length=256, blank=True, default="")
+    product = models.CharField(max_length=256, blank=True, default="")
+    # Match key + API origin: the longest entry whose URL covers the project wins.
+    api_url = models.CharField(max_length=256, unique=True)
     token = models.CharField(max_length=256)
     webhook_secret = models.CharField(max_length=256, blank=True, default="")
     enabled = models.BooleanField(default=True)
@@ -126,10 +136,10 @@ class RepoTokenEntry(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ["prefix"]
+        ordering = ["api_url"]
 
     def __str__(self) -> str:
-        return f"{self.prefix} -> {_mask_token(self.token)}"
+        return f"{self.product or self.api_url} -> {_mask_token(self.token)}"
 
 
 def _mask_token(token: str) -> str:

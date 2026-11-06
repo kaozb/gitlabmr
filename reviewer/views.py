@@ -5,7 +5,7 @@ thread pool, and always answer 200 quickly (GitLab retries slow webhooks,
 which would cause duplicate reviews).
 
 Auth: the ``X-Gitlab-Token`` header must match the global secret OR the
-matched repo prefix's own ``webhook_secret`` (per-repo GitLab webhooks carry
+matched repo entry's own ``webhook_secret`` (per-repo GitLab webhooks carry
 their own token). With no secret configured at all, requests are accepted
 without verification - intended for trusted intranets only.
 """
@@ -48,6 +48,17 @@ def _is_draft(attrs: dict) -> bool:
     return any(title.startswith(prefix) for prefix in DRAFT_PREFIXES)
 
 
+def _hostname(url: str) -> str:
+    """Host part of a URL ("" when there is none) - same normalisation as ui._api_host."""
+    value = (url or "").strip()
+    if not value:
+        return ""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    return (parsed.hostname or "").lower()
+
+
 @require_POST
 @csrf_exempt
 def gitlab_webhook(request):
@@ -59,8 +70,13 @@ def gitlab_webhook(request):
         return JsonResponse({"message": "bad json"}, status=400)
 
     kind = data.get("object_kind") or ""
-    project_path = (data.get("project") or {}).get("path_with_namespace", "")[:512]
-    repo = resolve_repo_token(conf, project_path) if project_path else None
+    project = data.get("project") or {}
+    project_path = (project.get("path_with_namespace", "") or "")[:512]
+    # The payload's own origin (project.web_url) decides which instance this
+    # event belongs to - never the configured default address, which may be a
+    # placeholder when every entry carries its full match URL.
+    host = _hostname(project.get("web_url", ""))
+    repo = resolve_repo_token(conf, project_path, host) if project_path else None
 
     configured = conf.webhook_secret or (repo.webhook_secret if repo is not None else None)
     if configured is None:
@@ -71,6 +87,7 @@ def gitlab_webhook(request):
         return JsonResponse({"message": "unauthorized"}, status=403)
 
     event = WebhookEvent(object_kind=kind[:32], project_path=project_path)
+    event.host = host  # request-scoped, never persisted
     try:
         if kind == "merge_request":
             handled, note, mr_iid, action = _handle_merge_request(conf, data, event)
@@ -109,9 +126,9 @@ def _handle_merge_request(conf, data: dict, event: WebhookEvent) -> tuple[str, s
     if not mr_iid or not event.project_path:
         return "ignored", "missing project path or MR iid", None, action
 
-    repo = resolve_repo_token(conf, event.project_path)
+    repo = resolve_repo_token(conf, event.project_path, event.host)
     if repo is None:
-        return "ignored", "no token configured for this project prefix", int(mr_iid), action
+        return "ignored", "no token configured for this repo", int(mr_iid), action
     if _is_bot((data.get("user") or {}).get("username", ""), conf.bot_indicators):
         return "ignored", "bot user", int(mr_iid), action
     if _is_draft(attrs):
@@ -126,7 +143,7 @@ def _handle_merge_request(conf, data: dict, event: WebhookEvent) -> tuple[str, s
     if not event.head_sha:
         return "ignored", "webhook payload has no head sha", int(mr_iid), action
 
-    submit_review(event.project_path, int(mr_iid), source="webhook")
+    submit_review(event.project_path, int(mr_iid), source="webhook", host=event.host)
     return "review", f"submitted {event.project_path}!{mr_iid}@{event.head_sha[:8]}", int(mr_iid), action
 
 
@@ -142,8 +159,8 @@ def _handle_note(conf, data: dict, event: WebhookEvent) -> tuple[str, str]:
         return "ignored", "note event missing MR reference"
     if _is_bot((data.get("user") or {}).get("username", ""), conf.bot_indicators):
         return "ignored", "bot user"
-    if not resolve_repo_token(conf, event.project_path):
-        return "ignored", "no token configured for this project prefix"
+    if not resolve_repo_token(conf, event.project_path, event.host):
+        return "ignored", "no token configured for this repo"
 
-    submit_review(event.project_path, int(mr_iid), source="note")
+    submit_review(event.project_path, int(mr_iid), source="note", host=event.host)
     return "review", f"submitted by comment on {event.project_path}!{mr_iid}"

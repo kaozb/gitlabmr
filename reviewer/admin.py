@@ -24,8 +24,8 @@ class ReviewRecordAdmin(admin.ModelAdmin):
 
 @admin.register(RepoTokenEntry)
 class RepoTokenEntryAdmin(admin.ModelAdmin):
-    list_display = ("prefix", "api_url", "token", "webhook_secret", "enabled", "note", "updated_at")
-    search_fields = ("prefix", "note")
+    list_display = ("product", "api_url", "token", "webhook_secret", "enabled", "note", "updated_at")
+    search_fields = ("product", "api_url", "note")
 
 
 @admin.register(Setting)

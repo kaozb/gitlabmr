@@ -1,13 +1,13 @@
 # gitlabmr — GitLab MR AI 评审服务
 
-参考 [PR-Agent](https://github.com/qodo-ai/pr-agent) 的评审链路设计，用 Django 从零实现的轻量 GitLab MR AI 评审服务：接收 Webhook → 拉取 MR diff → LLM 结构化评审 → 结论回写 MR（总结评论 + 可选行内评论）。支持**多仓库按 project path 前缀自动匹配 API 令牌**。
+参考 [PR-Agent](https://github.com/qodo-ai/pr-agent) 的评审链路设计，用 Django 从零实现的轻量 GitLab MR AI 评审服务：接收 Webhook → 拉取 MR diff → LLM 结构化评审 → 结论回写 MR（总结评论 + 可选行内评论）。支持**多仓库按 GitLab URL 前缀自动匹配 API 令牌**。
 
 - 设计与分析文档：[docs/01-pr-agent-review-analysis.md](docs/01-pr-agent-review-analysis.md)（PR-Agent 链路分析）、[docs/02-design.md](docs/02-design.md)（建设方案与评审记录）
 
 ## 架构一图
 
 ```
-GitLab webhook ─▶ 验签/过滤/去重 ─▶ 线程池 ─▶ TokenResolver(前缀→令牌)
+GitLab webhook ─▶ 验签/过滤/去重 ─▶ 线程池 ─▶ TokenResolver(GitLab URL 前缀→令牌)
                                             ─▶ DiffBuilder(行号化+预算裁剪)
                                             ─▶ LLM(YAML schema+回退链)
                                             ─▶ 回写(持久化评论/行内评论/失败评论)
@@ -36,30 +36,29 @@ python manage.py test reviewer -v 1
 启动后打开 `http://<your-host>:8000/` 即是控制台首页：
 
 - **评审总览**：成功/失败/进行中/跳过统计、最近 50 条评审记录（状态、评分、风险、问题数、模型、耗时）、最近 20 条 Webhook 事件，并可**手动触发评审**（直接把浏览器地址栏的 MR 链接粘进输入框即可，也支持 `group/repo!42` 简写）与**一键重试失败评审**（点进详情页）。
-- **服务设置**（`/settings/`）：直接在网页上配置全局项（Webhook 密钥、默认 GitLab 地址/令牌、LLM 接口与模型、回退模型、diff 预算、行内评论、忽略分支等）以及**多仓库前缀令牌**（增删改、启用/停用；列表默认只展示表格，点「＋ 新增前缀」或某行「编辑」才展开表单；编辑态所有字段（含前缀本身）都可修改，改前缀等于按记录 ID 重命名，与其他前缀冲突时会被拒绝）。
+- **评审详情**：除流程步骤与文件清单外，还以「非行内评审意见」面板记录**未以行内评论发表的问题**（回落到总结评论的那部分，含文件/行号/类型/证据），与 GitLab 上的 MR 评论区互为镜像。
+- **服务设置**（`/settings/`）：直接在网页上配置全局项（Webhook 密钥、默认 GitLab 地址/令牌、LLM 接口与模型、回退模型、diff 预算、行内评论、忽略分支等）以及**多仓库令牌**（增删改、启用/停用；列表默认只展示表格，点「＋ 新增令牌」或某行「编辑」才展开表单；「产品」是自由标签随便填，「API 地址」是匹配依据、不能重复，编辑态所有字段都可修改）。
 - **立即生效**：设置保存在数据库中，优先于环境变量；文本/数字留空 = 沿用环境变量，密钥留空 = 保持不变。配置缓存约 10 秒自动刷新，无需重启进程（`workers` 除外，改后需重启）。数据库令牌表非空时整体取代 env/文件令牌，清空则回落到 env/文件配置。
-- **访问保护**：设置环境变量 `GITLABMR_UI_PASSWORD` 后，控制台需要密码登录（session 会话）；不设置则免登录（仅建议内网使用）。密钥在页面中只显示掩码（`glpa****56`），不会回显明文。
+- **访问保护**：控制台强制登录 —— 企业微信扫码/免密登录为主通道（PC 扫码、企微内免密授权），未登录访问任何页面都会先跳企微授权；另设密码后备通道（设置 `GITLABMR_UI_PASSWORD` 才启用，企微不可用时应急）。GitLab Webhook 与 `/health/` 保持公开，不受登录保护影响。密钥在页面中只显示掩码（`glpa****56`），不会回显明文。
 
-## 多仓库前缀令牌
+## 多仓库令牌
 
 `repo_tokens.yml`（或环境变量 `GITLABMR_REPO_TOKENS` 内联 JSON）：
 
 ```yaml
-default:                      # 未命中前缀时兜底（可省略，省略则未知仓库被忽略）
-  api_url: https://gitlab.com
-  token: glpat-default
 repos:
-  - prefix: backend/          # 匹配 project path 前缀，纯字符串前缀，长前缀优先
-    api_url: https://gitlab.example.com
-    token: glpat-backend
+  - match_url: https://gitlab.example.com/tp/CNEOSv2   # 匹配依据：GitLab URL 前缀，最长者生效
+    product: CNEOSv2          # 可选：仅作展示标签，与匹配无关，可随意填
+    token: glpat-cneosv2
     webhook_secret: whsec-b1  # 可选：该仓库 webhook 的独立令牌
-  - prefix: backend/team-a/
-    token: glpat-team-a
+  - match_url: https://gitlab.example.com/tp
+    token: glpat-tp
 ```
 
-- 所有前缀视为一个集合，逐个对 MR 的项目路径做**忽略大小写**的字符串前缀匹配，命中项里**前缀最长**的那条胜出。
-- 前缀写法等价：`tp`、`tp/`、`TP` 都能命中 `tp/CNEOSv2/NetF/npp/npp.v2.0`；`tp/CNE` 同样命中（非段边界也匹配）。
-- `backend/team-a/svc` 命中 `backend/team-a/`，`backend/pay` 命中 `backend/`；只配了 `backend` 时 `backendx/svc` 也会命中 `backend`——需要更精确就把更长、更具体的前缀加进集合（最长者优先）。
+- **匹配依据是每条配置的 API 地址**（完整 GitLab URL 前缀）。真实仓库 `https://gitlab.example.com/tp/CNEOSv2/Engine/epi-5.0` 能被 `…/tp`、`…/tp/CNEOSv`、`…/tp/CNEOSv2/Engine/epi-5.` 中任意一条命中；所有启用条目构成一个集合逐个比对，命中项里**地址最长**的那条胜出，用它的令牌。
+- 归一化规则：整条 URL 忽略大小写（与旧版前缀匹配一致），末尾 `/` 忽略。
+- 没有任何地址命中时回落到「默认 GitLab 地址 + 默认访问令牌」（默认地址也参与匹配：链接域名与它不同则不兜底）；连默认令牌都没有 → 事件记 `ignored(no_token)`，不报错。
+- `product`（产品）只是给人看的标签，随便填、随时改，不影响匹配。
 - 每次评审将解析出的令牌作为参数显式传递，无全局可变状态，多仓库并发天然隔离。
 - 除了 env/文件，也可以直接在控制台「服务设置」页维护这批令牌（存数据库，优先级更高，见上文）。
 
@@ -78,7 +77,7 @@ https://gitlab.inone.nsfocus.com/tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS/-/mer
 ## GitLab 侧配置
 
 1. 为每个（组）仓库建 Webhook：`http://<your-host>/tech_powered/code_review/`，Trigger 勾选 *Merge request events* 与 *Note events*，Secret token 填 `GITLABMR_WEBHOOK_SECRET`（或该仓库自己的 `webhook_secret`）。**两边都留空 = 不验签**（仅建议可信内网使用）。
-2. 为每个前缀准备 Personal Access Token（需要 `api` 权限，能读 MR/写评论）。
+2. 为每条令牌配置准备 Personal Access Token（需要 `api` 权限，能读 MR/写评论）。
 3. MR 打开/重开/推送新提交会自动评审；在 MR 里评论 `/review` 可手动触发。
 
 ## 评审结论回写行为
@@ -115,10 +114,11 @@ gitlabmr/
 │   ├── models.py      # WebhookEvent / ReviewRecord（幂等闸门）/ Setting / RepoTokenEntry
 │   ├── views.py       # webhook 端点（验签、过滤、投递）
 │   ├── ui.py          # 控制台：总览 / 设置 / 详情 / 重试 / 手动触发 / 登录
+│   ├── wework.py      # 企业微信扫码/免密登录（自建中转服务版，无 secret）
 │   ├── templates/     # 控制台页面（base/dashboard/settings/review_detail/login）
 │   ├── tests.py       # 离线单测
 │   └── services/
-│       ├── tokens.py      # 前缀→令牌解析
+│       ├── tokens.py      # GitLab URL 前缀→令牌解析（最长地址优先）
 │       ├── gitlab.py      # GitLab REST v4 薄客户端
 │       ├── diffctx.py     # diff 行号化 + token 预算裁剪
 │       ├── repoctx.py     # API 上下文增强：全文拉取 + 符号引用搜索

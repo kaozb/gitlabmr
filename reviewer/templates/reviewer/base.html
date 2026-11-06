@@ -25,7 +25,7 @@
     nav a.active { color: #fff; font-weight: 700; border-bottom: 2px solid #7c9bff; }
     nav .spacer { flex: 1; }
     nav .tag { font-size: 12px; color: #8b94ad; }
-    main { max-width: 1180px; margin: 26px auto 60px; padding: 0 24px; }
+    main {  margin: 26px auto 60px; padding: 0 24px; }
     h1 { font-size: 20px; margin: 0 0 4px; }
     h2 { font-size: 16px; margin: 0; }
     .sub { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
@@ -116,10 +116,11 @@
   <a href="{% url 'reviewer:settings-llm' %}" {% if request.resolver_match.url_name == 'settings-llm' %}class="active"{% endif %}>LLM 设置</a>
   <a href="{% url 'reviewer:settings-repos' %}" {% if request.resolver_match.url_name == 'settings-repos' %}class="active"{% endif %}>仓库令牌</a>
   <span class="spacer"></span>
-  {% if ui_password_set %}
-    {% if ui_authed %}<span class="tag">已登录</span><a href="{% url 'reviewer:logout' %}">退出</a>
-    {% else %}<span class="tag">未登录</span>{% endif %}
-  {% else %}<span class="tag">未设置访问密码（建议配置 GITLABMR_UI_PASSWORD）</span>{% endif %}
+  {% if ui_authed %}
+    {% if wework_userid %}<span class="tag">已登录：{{ wework_userid }}</span>
+    {% else %}<span class="tag">已登录（密码）</span>{% endif %}
+    <a href="{% url 'reviewer:logout' %}">退出</a>
+  {% else %}<span class="tag">未登录</span><a href="{% url 'reviewer:wework-login' %}">企微登录</a>{% endif %}
 </nav>
 <main>
   {% if messages %}
