@@ -23,10 +23,12 @@ from .services.llm import (
     ReviewOutput,
     chat,
     extract_yaml_block,
+    filter_unverified_absence_issues,
     parse_review,
     review_with_fallback,
 )
-from .services.prompts import build_system_prompt
+from .services.prompts import build_system_prompt, build_user_prompt
+from .services.repoctx import build_repo_context, extract_symbols
 from .services.render import (
     PROGRESS_MARKER,
     REVIEW_MARKER,
@@ -75,6 +77,12 @@ SAMPLE_PATCH = """@@ -1,3 +1,4 @@
 @@ -10,2 +11,3 @@
  ctx
 +second added
+"""
+
+DEF_PATCH = """@@ -1,2 +1,4 @@
+ import os
++def process_payment(amount):
++    return amount
 """
 
 # Dense patch: every line of the new file 1..20 is a hunk line, so tests can
@@ -189,6 +197,138 @@ class DiffContextTests(TestCase):
         self.assertEqual(ctx.filtered_files, ["img.png"])
 
 
+class RepoCtxTests(TestCase):
+    def _ctx(self, changes: list[dict]):
+        return build_diff_context(changes, max_tokens=10000)
+
+    def test_extract_symbols_from_definitions_and_new_files(self):
+        ctx = self._ctx(
+            [
+                {"new_path": "app.py", "old_path": "app.py", "diff": DEF_PATCH},
+                {
+                    "new_path": "pkg/brand_new_module.py",
+                    "old_path": "pkg/brand_new_module.py",
+                    "diff": "@@ -0,0 +1,1 @@\n+value = 1\n",
+                    "new_file": True,
+                },
+            ]
+        )
+        self.assertEqual(extract_symbols(ctx, limit=8), ["process_payment", "brand_new_module"])
+
+    def test_extract_symbols_skips_unreviewed_and_caps(self):
+        big = DEF_PATCH * 3
+        ctx = self._ctx(
+            [
+                {"new_path": "app.py", "old_path": "app.py", "diff": big},
+                {"new_path": "skip.md", "old_path": "skip.md", "diff": DEF_PATCH},  # ignored glob
+            ]
+        )
+        self.assertNotIn("skip.md", ctx.reviewed_files)
+        symbols = extract_symbols(ctx, limit=2)
+        self.assertEqual(symbols, ["process_payment"])  # deduped, filtered file not scanned
+
+    def test_build_repo_context_fetches_files_and_references(self):
+        ctx = self._ctx([{"new_path": "app.py", "old_path": "app.py", "diff": DEF_PATCH}])
+        client = MagicMock()
+        client.get_file_content.return_value = "import os\n\ndef run():\n    pass\n"
+        client.search_blobs.return_value = [
+            {"path": "src/caller.py", "data": "process_payment(1)", "startline": 42},
+            {"path": "app.py", "data": "def process_payment(amount)", "startline": 2},  # in-diff: excluded
+        ]
+        text, stats = build_repo_context(client, "g/r", "a" * 40, ctx)
+        self.assertIn("Full content: `app.py`", text)
+        self.assertIn("    1  import os", text)  # numbered lines make path:LINE citable
+        client.search_blobs.assert_called_once_with("g/r", "process_payment", "a" * 40)
+        self.assertIn("src/caller.py:42", text)
+        self.assertNotIn("app.py:2", text)
+        self.assertEqual(stats["files"], ["app.py"])
+        self.assertEqual(stats["symbols"], ["process_payment"])
+        self.assertTrue(stats["search_available"])
+
+    def test_search_unavailable_keeps_file_context(self):
+        ctx = self._ctx([{"new_path": "app.py", "old_path": "app.py", "diff": DEF_PATCH}])
+        client = MagicMock()
+        client.get_file_content.return_value = "content"
+        client.search_blobs.return_value = None  # advanced search not enabled
+        text, stats = build_repo_context(client, "g/r", "a" * 40, ctx)
+        self.assertIn("Full content: `app.py`", text)
+        self.assertNotIn("References found", text)
+        self.assertFalse(stats["search_available"])
+        self.assertEqual(stats["symbols"], [])
+
+    def test_api_failures_degrade_to_empty_context(self):
+        ctx = self._ctx([{"new_path": "app.py", "old_path": "app.py", "diff": DEF_PATCH}])
+        client = MagicMock()
+        client.get_file_content.side_effect = GitLabError("GET raw returned 404", status=404)
+        client.search_blobs.side_effect = GitLabError("GET search returned 500", status=500)
+        text, stats = build_repo_context(client, "g/r", "a" * 40, ctx)
+        self.assertEqual(text, "")
+        self.assertEqual(stats["files"], [])
+
+    def test_non_string_responses_degrade_silently(self):
+        """Plain MagicMock client (pipeline tests): nothing usable -> no context."""
+        ctx = self._ctx([{"new_path": "app.py", "old_path": "app.py", "diff": DEF_PATCH}])
+        text, stats = build_repo_context(MagicMock(), "g/r", "a" * 40, ctx)
+        self.assertEqual(text, "")
+        self.assertEqual(stats["files"], [])
+        self.assertFalse(stats["search_available"])
+
+
+class AbsenceFilterTests(TestCase):
+    def _review_with(self, issue_yaml: str) -> ReviewOutput:
+        return parse_review(
+            "review:\n  overall_assessment: ok\n  score: 70\n"
+            f"  key_issues_to_review:\n{issue_yaml}"
+            "  relevant_tests: No\n  security_concerns: No\n",
+            num_max_findings=6,
+        )
+
+    def test_unverified_unused_claim_dropped(self):
+        review = self._review_with(
+            "    - relevant_file: app.py\n      issue_header: Unused\n"
+            "      issue_content: helper_process is unused and can be removed\n"
+            "      start_line: 2\n      end_line: 2\n"
+        )
+        filtered, dropped = filter_unverified_absence_issues(review)
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(filtered.key_issues_to_review, [])
+
+    def test_claim_with_real_evidence_kept(self):
+        review = self._review_with(
+            "    - relevant_file: app.py\n      issue_header: Unused\n"
+            "      issue_content: helper_process is unused - repo search found no reference\n"
+            "      start_line: 2\n      end_line: 2\n"
+            "      kind: verified\n      evidence: 'blob search: 0 hits'\n"
+        )
+        filtered, dropped = filter_unverified_absence_issues(review)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(filtered.key_issues_to_review), 1)
+        self.assertEqual(filtered.key_issues_to_review[0].evidence, "blob search: 0 hits")
+
+    def test_patch_only_evidence_does_not_save_absence_claim(self):
+        review = self._review_with(
+            "    - relevant_file: app.py\n      issue_header: Missing\n"
+            "      issue_content: this symbol is not defined anywhere in the repo\n"
+            "      start_line: 2\n      end_line: 2\n"
+            "      kind: verified\n      evidence: patch-only\n"
+        )
+        filtered, dropped = filter_unverified_absence_issues(review)
+        self.assertEqual(len(dropped), 1)
+
+    def test_diff_content_suggestions_are_never_filtered(self):
+        review = self._review_with(
+            "    - relevant_file: app.py\n      issue_header: Robustness\n"
+            "      issue_content: 新增代码缺少对空输入的错误处理，会在 amount 为 None 时抛异常\n"
+            "      start_line: 2\n      end_line: 2\n      kind: suggestion\n      evidence: patch-only\n"
+            "    - relevant_file: app.py\n      issue_header: Bug\n"
+            "      issue_content: off-by-one in the new loop bounds\n"
+            "      start_line: 3\n      end_line: 3\n"
+        )
+        filtered, dropped = filter_unverified_absence_issues(review)
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(filtered.key_issues_to_review), 2)
+
+
 class PromptTests(TestCase):
     def test_findings_ordered_by_complexity_then_length(self):
         system = build_system_prompt(6, "zh-CN")
@@ -202,6 +342,24 @@ class PromptTests(TestCase):
         self.assertIn("actually present in that file's diff", system)
         self.assertIn("Never point at a file the diff", system)
 
+    def test_prompt_declares_context_boundary_and_evidence_rule(self):
+        system = build_system_prompt(6, "zh-CN")
+        self.assertIn("Context boundary", system)
+        self.assertIn("is allowed ONLY", system)
+        self.assertIn("assume you cannot see", system)
+        self.assertIn("kind: verified", system)
+        self.assertIn("kind: suggestion", system)
+
+    def test_user_prompt_embeds_repo_context_as_evidence(self):
+        ctx = build_diff_context([{"new_path": "app.py", "old_path": "app.py", "diff": SAMPLE_PATCH}], max_tokens=10000)
+        kwargs = dict(
+            title="t", description="", author="a", source_branch="f", target_branch="m", commit_messages=""
+        )
+        user = build_user_prompt(**kwargs, diff_ctx=ctx, repo_context="REPOCTX-MARKER")
+        self.assertIn("cite it as evidence", user)
+        self.assertIn("REPOCTX-MARKER", user)
+        self.assertNotIn("Repository context", build_user_prompt(**kwargs, diff_ctx=ctx))
+
 
 class LLMParseTests(TestCase):
     def test_extract_yaml_block(self):
@@ -213,6 +371,36 @@ class LLMParseTests(TestCase):
         self.assertEqual(review.score, 88)
         self.assertEqual(review.risk_level, "low")
         self.assertEqual(review.key_issues_to_review[0].relevant_file, "app.py")
+
+    def test_parse_kind_and_evidence_fields(self):
+        review = parse_review(
+            "review:\n  key_issues_to_review:\n"
+            "    - relevant_file: app.py\n      issue_content: x\n"
+            "      start_line: 1\n      end_line: 1\n"
+            "      kind: Verified\n      evidence: 'src/a.py:12'\n",
+            num_max_findings=6,
+        )
+        issue = review.key_issues_to_review[0]
+        self.assertEqual(issue.kind, "verified")  # normalized to lowercase literal
+        self.assertEqual(issue.evidence, "src/a.py:12")
+
+    def test_kind_and_evidence_default_empty(self):
+        review = parse_review(GOOD_REVIEW_YAML, num_max_findings=6)
+        issue = review.key_issues_to_review[0]
+        self.assertEqual(issue.kind, "")
+        self.assertEqual(issue.evidence, "")
+
+    def test_invalid_kind_and_non_string_evidence_normalised(self):
+        review = parse_review(
+            "review:\n  key_issues_to_review:\n"
+            "    - relevant_file: app.py\n      issue_content: x\n"
+            "      start_line: 1\n      end_line: 1\n"
+            "      kind: maybe\n      evidence: 42\n",
+            num_max_findings=6,
+        )
+        issue = review.key_issues_to_review[0]
+        self.assertEqual(issue.kind, "")
+        self.assertEqual(issue.evidence, "")
 
     def test_repair_broken_colon_value(self):
         raw = "review:\n  overall_assessment: uses config: default path\n  score: 70\n"
@@ -511,6 +699,20 @@ class PipelineTests(TestCase):
         self.assertTrue(any("评审失败" in b for b in bodies))
         client.delete_note.assert_called_once()  # progress note removed on failure too
 
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_context_enrichment_failure_does_not_break_review(self, client_cls, review_fn):
+        client = self._client_mock()
+        client.get_file_content.side_effect = GitLabError("GET raw returned 500", status=500)
+        client_cls.return_value = client
+        review_fn.return_value = (parse_review(GOOD_REVIEW_YAML, num_max_findings=6), "test-model")
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+        record = ReviewRecord.objects.get()
+        self.assertEqual(record.status, "success")
+        self.assertEqual(record.issues_count, 1)
+
     @patch("reviewer.services.pipeline.GitLabClient")
     def test_read_failure_recorded_for_dashboard(self, client_cls):
         client = MagicMock()
@@ -800,6 +1002,15 @@ class ConfDbOverrideTests(TestCase):
             conf = reload_conf()
         self.assertEqual(conf.inline_max_comments, MAX_INLINE_COMMENTS)
         self.assertEqual(conf.num_max_findings, MAX_FINDINGS)
+
+    def test_context_enrichment_env_knobs(self):
+        with patch.dict(os.environ, {"GITLABMR_CONTEXT_ENRICHMENT": "false",
+                                     "GITLABMR_CONTEXT_MAX_FILES": "3",
+                                     "GITLABMR_CONTEXT_MAX_FILE_CHARS": "5000",
+                                     "GITLABMR_CONTEXT_MAX_SYMBOLS": "2"}):
+            conf = reload_conf()
+        self.assertFalse(conf.context_enrichment)
+        self.assertEqual((conf.context_max_files, conf.context_max_file_chars, conf.context_max_symbols), (3, 5000, 2))
 
     def test_db_cannot_exceed_inline_and_findings_ceilings(self):
         Setting.objects.create(inline_max_comments=500, num_max_findings=100)

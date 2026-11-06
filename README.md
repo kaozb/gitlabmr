@@ -89,6 +89,18 @@ https://gitlab.inone.nsfocus.com/tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS/-/mer
 - 失败回写：LLM/GitLab 出错时在 MR 发一条脱敏失败评论（错误按白名单归类，不泄漏堆栈）。
 - 幂等：同一 MR 同一 head sha 只评审一次（数据库唯一约束），failed 的记录重试时自动重置。
 
+## 上下文增强与证据约束（第一层）
+
+diff 之外的仓库内容模型默认不可见，这会产生两类典型误判：把"在 diff 外有调用方"的代码判成未使用（误报），以及漏掉"签名改了但调用方没同步"（漏报）。本服务用**纯 GitLab API**（无需克隆仓库）收窄盲区：
+
+- **全文补充**：对纳入评审的变更文件（patch 小的优先，`GITLABMR_CONTEXT_MAX_FILES` 控制），通过 `repository files/raw` API 在 MR head sha 处拉取**带行号的全文**注入提示词，模型可以核对整个文件的 import/定义，并能以 `path:行号` 引用证据。
+- **引用搜索**：从 diff 新增行提取定义符号（`def/class/function/func/...` 及新文件名，`GITLABMR_CONTEXT_MAX_SYMBOLS` 控制），逐个走 `search?scope=blobs` API 查全库引用，把"是否被使用"从猜测变成模型眼前的事实。自建 GitLab 未启用高级搜索时自动跳过（400/403 识别），不影响其余流程。
+- **提示词边界声明**：system prompt 明确告知模型"你只能看到 patch 与 API 提供的上下文"，凡是关于仓库全局状态的断言（未使用/缺少定义/调用方未更新/缺少注册）**必须引用所给上下文中的证据**，否则不得输出；只针对变更行本身的建议（逻辑、边界、错误处理）不受此限。
+- **输出契约**：每条问题带 `kind`（`verified`=引用了证据的全局断言 / `suggestion`=仅基于 diff 的建议）与 `evidence` 字段；总结评论中 `verified` 问题会附上"证据 Evidence"行。
+- **代码级兜底**：LLM 返回后做后置过滤——匹配"未使用/未被调用/未定义/不存在"类**缺失断言**但 `kind != verified` 或证据为 `patch-only` 的问题直接丢弃（可配置的 `suggestion` 类建议不受影响），防止模型过度自信时臆断。
+
+全部为尽力而为：增强失败自动退化为仅 diff 评审，`GITLABMR_CONTEXT_ENRICHMENT=false` 可整体关闭。
+
 ## 环境变量
 
 见 [.env.example](.env.example)，全部条目均有注释。这些变量只是**默认值**：控制台「服务设置」里保存过的项优先于环境变量（留空则继续沿用环境变量）。
@@ -109,6 +121,7 @@ gitlabmr/
 │       ├── tokens.py      # 前缀→令牌解析
 │       ├── gitlab.py      # GitLab REST v4 薄客户端
 │       ├── diffctx.py     # diff 行号化 + token 预算裁剪
+│       ├── repoctx.py     # API 上下文增强：全文拉取 + 符号引用搜索
 │       ├── prompts.py     # system/user prompt
 │       ├── llm.py         # LLM 调用 + YAML 解析校验 + 模型回退
 │       ├── render.py      # Markdown 渲染/截断/失败文案

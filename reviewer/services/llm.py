@@ -35,6 +35,8 @@ class KeyIssue(BaseModel):
     issue_content: str = Field(min_length=1)
     start_line: int = Field(ge=1)
     end_line: int = Field(ge=1)
+    kind: str = ""  # verified | suggestion | "" (older models may omit it)
+    evidence: str = ""
 
     @field_validator("relevant_file")
     @classmethod
@@ -48,6 +50,21 @@ class KeyIssue(BaseModel):
         if value < start:
             raise ValueError("end_line must be >= start_line")
         return value
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _norm_kind(cls, value):
+        if not isinstance(value, str):
+            return ""
+        lowered = value.strip().lower()
+        return lowered if lowered in ("verified", "suggestion") else ""
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _norm_evidence(cls, value):
+        if not isinstance(value, str):
+            return ""
+        return value.strip()[:500]
 
 
 class ReviewOutput(BaseModel):
@@ -91,6 +108,42 @@ class ReviewOutput(BaseModel):
 
 _FENCE_RE = re.compile(r"```(?:ya?ml)?\s*\n(.*?)```", re.DOTALL)
 _BROKEN_VALUE_RE = re.compile(r"^(\s*-?\s*[\w.\[\]]+):(?!\S)(\s*)(.*:.*\S)?\s*$")
+
+# Absence claims about repository-wide state ("X is unused", "no caller was
+# updated", "the definition does not exist") are the classic diff-blind-spot
+# false positives. Deliberately narrow: bare "缺少/missing" also appears in
+# diff-content suggestions ("缺少错误处理") that must NOT be filtered.
+_ABSENCE_RE = re.compile(
+    r"未使用|未被调用|未被引用|无人调用|未被任何|无引用|未定义|不存在|未注册|"
+    r"unused|never used|not used|no caller|not called|not referenced|not defined"
+    r"|undefined|dead code|unregistered",
+    re.IGNORECASE,
+)
+_PATCH_ONLY = ("", "patch-only", "patch only")
+
+
+def filter_unverified_absence_issues(review: ReviewOutput) -> tuple[ReviewOutput, list[KeyIssue]]:
+    """Post-filter backstop: drop absence claims that cite no evidence.
+
+    The prompt already forbids these; this is the code-side guarantee. An
+    absence claim survives only when ``kind == verified`` AND its evidence
+    points beyond the patch itself (a fetched file or a search result).
+    Returns (filtered review, dropped issues).
+    """
+    kept: list[KeyIssue] = []
+    dropped: list[KeyIssue] = []
+    for issue in review.key_issues_to_review:
+        claims_absence = bool(_ABSENCE_RE.search(f"{issue.issue_header} {issue.issue_content}"))
+        has_evidence = issue.kind == "verified" and issue.evidence.strip().lower() not in _PATCH_ONLY
+        if claims_absence and not has_evidence:
+            dropped.append(issue)
+        else:
+            kept.append(issue)
+    if not dropped:
+        return review, []
+    data = review.model_dump()
+    data["key_issues_to_review"] = [i.model_dump() for i in kept]
+    return ReviewOutput.model_validate(data), dropped
 
 
 def extract_yaml_block(text: str) -> str:

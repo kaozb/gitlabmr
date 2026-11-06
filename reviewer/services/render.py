@@ -48,12 +48,10 @@ def render_review(
         lines += [f"### ⚡ 关键问题 ({len(issues)})", ""]
         for index, issue in enumerate(issues, start=1):
             location = f"`{issue.relevant_file}` L{issue.start_line}-L{issue.end_line}"
-            lines += [
-                f"**{index}. {issue.issue_header.strip()}** — {location}",
-                "",
-                issue.issue_content.strip(),
-                "",
-            ]
+            lines += [f"**{index}. {issue.issue_header.strip()}** — {location}", "", issue.issue_content.strip()]
+            if issue.kind == "verified" and issue.evidence:
+                lines += ["", f"> 证据 Evidence: `{issue.evidence.strip()}`"]
+            lines += [""]
     else:
         lines += ["### ✅ 未发现关键问题", "", "未发现明确的、可定位的问题。", ""]
 
