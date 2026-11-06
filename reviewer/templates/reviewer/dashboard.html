@@ -9,7 +9,8 @@
   <div class="stat err"><div class="num">{{ stats.failed }}</div><div class="label">失败</div></div>
   <div class="stat info"><div class="num">{{ stats.running }}</div><div class="label">进行中</div></div>
   <div class="stat idle"><div class="num">{{ stats.skipped }}</div><div class="label">跳过</div></div>
-  <div class="stat"><div class="num">{{ stats.events }}</div><div class="label">Webhook 事件</div></div>
+  <div class="stat idle"><div class="num">{{ stats.skipped }}</div><div class="label">跳过</div></div>
+  <a class="stat" href="{% url 'reviewer:webhook-events' %}"><div class="num">{{ stats.events }}</div><div class="label">Webhook 事件 ›</div></a>
 </div>
 
 <div class="card" style="margin-top:20px">
@@ -69,42 +70,16 @@
   {% endif %}
 </div>
 
-<div class="grid cols-3">
-  <div class="card" style="grid-column:span 2">
-    <div class="card-head">
-      <h2>Webhook 事件</h2>
-      <span class="muted">最近 20 条</span>
-    </div>
-    {% if events %}
-    <table>
-      <thead><tr><th>时间</th><th>类型</th><th>项目</th><th>动作</th><th>处理</th><th>说明</th></tr></thead>
-      <tbody>
-        {% for e in events %}
-        <tr>
-          <td class="muted mono">{{ e.created_at|date:"m-d H:i:s" }}</td>
-          <td>{{ e.object_kind }}</td>
-          <td class="mono">{{ e.project_path|default:"—" }}</td>
-          <td>{{ e.action|default:"—" }}</td>
-          <td><span class="badge {% if e.handled == 'review' %}success{% elif e.handled == 'error' %}failed{% else %}skipped{% endif %}">{{ e.handled }}</span></td>
-          <td class="muted">{{ e.note|default:"—" }}</td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
-    {% else %}<div class="empty">尚未收到任何 Webhook 事件</div>{% endif %}
+<div class="card">
+  <div class="card-head">
+    <h2>服务状态</h2>
+    <a class="btn small" href="{% url 'reviewer:webhook-events' %}">查看 Webhook 事件</a>
   </div>
-
-  <div class="card">
-    <div class="card-head">
-      <h2>服务状态</h2>
-      <a class="btn small" href="{% url 'reviewer:settings' %}">去配置</a>
-    </div>
-    <dl class="kv">
-      {% for label, value, ok in summary %}
-      <dt>{{ label }}</dt>
-      <dd>{{ value }} {% if ok %}<span class="pill-yes">✓</span>{% else %}<span class="pill-no">✗</span>{% endif %}</dd>
-      {% endfor %}
-    </dl>
-  </div>
+  <dl class="kv">
+    {% for label, value, ok in summary %}
+    <dt>{{ label }}</dt>
+    <dd>{{ value }} {% if ok %}<span class="pill-yes">✓</span>{% else %}<span class="pill-no">✗</span>{% endif %}</dd>
+    {% endfor %}
+  </dl>
 </div>
 {% endblock %}

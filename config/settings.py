@@ -58,6 +58,11 @@ DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
         "NAME": BASE_DIR / os.environ.get("GITLABMR_DB_NAME", "gitlabmr.sqlite3"),
+        "OPTIONS": {
+            # WAL 模式：读写不互斥，缓解 dev server 与测试/脚本并发时的 database is locked
+            "init_command": "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;",
+            "timeout": 10,  # sqlite3.connect busy timeout（秒）
+        },
     }
 }
 

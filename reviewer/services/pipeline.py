@@ -289,7 +289,6 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             remaining_files=diff_ctx.not_reviewed_files,
             filtered_files=diff_ctx.filtered_files,
             language=conf.language,
-            model_used=model_used,
         )
         mode = _publish_persistent_comment(client, project_path, mr_iid, body, conf.max_comment_chars)
         publish_detail = mode if not inline_published else f"{mode}（{len(inline_published)} 条行内评论）"
@@ -514,7 +513,7 @@ def _publish_inline_comments(
             "old_path": issue.relevant_file,
             "new_line": issue.start_line - 1,  # GitLab positions are 0-based
         }
-        body = f"**{issue.issue_header.strip()}**: {issue.issue_content.strip()}\n<!-- gitlabmr:inline -->"
+        body = f"{issue.issue_content.strip()}\n<!-- gitlabmr:inline -->"
         try:
             client.create_inline_discussion(project_path, mr_iid, body, position)
             published.add(index)

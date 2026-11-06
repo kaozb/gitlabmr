@@ -27,7 +27,7 @@
 ## 2. 总体架构
 
 ```
-GitLab ──webhook──▶ Django view (POST /webhook/gitlab/)
+GitLab ──webhook──▶ Django view (POST /tech_powered/code_review/)
                       │ 1. X-Gitlab-Token 校验（constant-time）
                       │ 2. 事件过滤：kind/动作/bot/draft/忽略分支
                       │ 3. 同 MR 同 head_sha 幂等检查（DB 唯一约束）
@@ -222,5 +222,5 @@ repos:
   1. `uv pip install -r requirements.txt`（或 pip）；
   2. 配 `.env` → `python manage.py migrate` → `python manage.py runserver`；
   3. `python manage.py test reviewer` 全绿；
-  4. `curl -X POST :8000/webhook/gitlab/ -H "X-Gitlab-Token: ..."` 样例 payload → `WebhookEvent` 落库；
+  4. `curl -X POST :8000/tech_powered/code_review/ -H "X-Gitlab-Token: ..."` 样例 payload → `WebhookEvent` 落库；
   5. 指向真实 GitLab：MR 上出现评审评论，二次 push 后评论被原位更新而非新增。

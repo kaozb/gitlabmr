@@ -26,9 +26,8 @@ def render_review(
     remaining_files: list[str] | None = None,
     filtered_files: list[str] | None = None,
     language: str = "zh-CN",
-    model_used: str = "",
 ) -> str:
-    lines: list[str] = [f"## 🤖 MR AI 评审 / AI Review  `{model_used}`", ""]
+    lines: list[str] = ["## 🤖 MR AI 评审 / AI Review（技术平台部提供支持）", ""]
     if review.overall_assessment:
         lines += [review.overall_assessment.strip(), ""]
 

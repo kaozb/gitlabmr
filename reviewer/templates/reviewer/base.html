@@ -22,6 +22,7 @@
     nav .brand::before { content: "⌘ "; color: #7c9bff; }
     nav a { color: #cdd5ea; padding: 4px 2px; }
     nav a:hover { color: #fff; text-decoration: none; }
+    nav a.active { color: #fff; font-weight: 700; border-bottom: 2px solid #7c9bff; }
     nav .spacer { flex: 1; }
     nav .tag { font-size: 12px; color: #8b94ad; }
     main { max-width: 1180px; margin: 26px auto 60px; padding: 0 24px; }
@@ -110,9 +111,10 @@
 <body>
 <nav>
   <a class="brand" href="{% url 'reviewer:dashboard' %}">GitLab MR AI 评审</a>
-  <a href="{% url 'reviewer:dashboard' %}">评审总览</a>
-  <a href="{% url 'reviewer:settings-llm' %}">LLM 设置</a>
-  <a href="{% url 'reviewer:settings-repos' %}">仓库令牌</a>
+  <a href="{% url 'reviewer:dashboard' %}" {% if request.resolver_match.url_name == 'dashboard' %}class="active"{% endif %}>评审总览</a>
+  <a href="{% url 'reviewer:webhook-events' %}" {% if request.resolver_match.url_name == 'webhook-events' %}class="active"{% endif %}>Webhook 事件</a>
+  <a href="{% url 'reviewer:settings-llm' %}" {% if request.resolver_match.url_name == 'settings-llm' %}class="active"{% endif %}>LLM 设置</a>
+  <a href="{% url 'reviewer:settings-repos' %}" {% if request.resolver_match.url_name == 'settings-repos' %}class="active"{% endif %}>仓库令牌</a>
   <span class="spacer"></span>
   {% if ui_password_set %}
     {% if ui_authed %}<span class="tag">已登录</span><a href="{% url 'reviewer:logout' %}">退出</a>

@@ -1,0 +1,42 @@
+{% extends "reviewer/base.html" %}
+{% block title %}Webhook 事件 - GitLab MR AI 评审控制台{% endblock %}
+{% block content %}
+<h1>Webhook 事件</h1>
+<p class="sub">GitLab 回调的审计流水。按产品策略仅记录每个 MR 的首次 open；reopen / update / note 走流程但不落库。</p>
+
+<div class="grid cols-6">
+  <div class="stat"><div class="num">{{ total }}</div><div class="label">累计事件</div></div>
+  {% for h, label, count in handled_stats %}
+  <div class="stat {{ label }}">
+    <div class="num">{{ count }}</div>
+    <div class="label">{{ h }}</div>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="card" style="margin-top:20px">
+  <div class="card-head">
+    <h2>事件流水</h2>
+    <span class="muted">最近 200 条</span>
+  </div>
+  {% if events %}
+  <table>
+    <thead><tr><th>时间</th><th>类型</th><th>项目</th><th>MR</th><th>动作</th><th>head sha</th><th>处理</th><th>说明</th></tr></thead>
+    <tbody>
+      {% for e in events %}
+      <tr>
+        <td class="muted mono">{{ e.created_at|date:"Y-m-d H:i:s" }}</td>
+        <td>{{ e.object_kind }}</td>
+        <td class="mono">{{ e.project_path|default:"—" }}</td>
+        <td>{% if e.mr_iid %}!{{ e.mr_iid }}{% else %}—{% endif %}</td>
+        <td>{{ e.action|default:"—" }}</td>
+        <td class="mono">{% if e.head_sha %}{{ e.head_sha|slice:":8" }}{% else %}—{% endif %}</td>
+        <td><span class="badge {% if e.handled == 'review' %}success{% elif e.handled == 'error' %}failed{% elif e.handled == 'rejected' %}failed{% else %}skipped{% endif %}">{{ e.handled }}</span></td>
+        <td class="muted">{{ e.note|default:"—" }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<div class="empty">尚未收到任何 Webhook 事件 —— 确认 GitLab 仓库已配置指向 <span class="mono">/tech_powered/code_review/</span> 的 Webhook</div>{% endif %}
+</div>
+{% endblock %}

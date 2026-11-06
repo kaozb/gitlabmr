@@ -77,7 +77,7 @@ https://gitlab.inone.nsfocus.com/tp/CNEOSv2/OS/kernel/linux-5.4.18-kylinOS/-/mer
 
 ## GitLab 侧配置
 
-1. 为每个（组）仓库建 Webhook：`http://<your-host>/webhook/gitlab/`，Trigger 勾选 *Merge request events* 与 *Note events*，Secret token 填 `GITLABMR_WEBHOOK_SECRET`（或该仓库自己的 `webhook_secret`）。**两边都留空 = 不验签**（仅建议可信内网使用）。
+1. 为每个（组）仓库建 Webhook：`http://<your-host>/tech_powered/code_review/`，Trigger 勾选 *Merge request events* 与 *Note events*，Secret token 填 `GITLABMR_WEBHOOK_SECRET`（或该仓库自己的 `webhook_secret`）。**两边都留空 = 不验签**（仅建议可信内网使用）。
 2. 为每个前缀准备 Personal Access Token（需要 `api` 权限，能读 MR/写评论）。
 3. MR 打开/重开/推送新提交会自动评审；在 MR 里评论 `/review` 可手动触发。
 
