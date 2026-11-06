@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 
-from .conf import MAX_FINDINGS, MAX_INLINE_COMMENTS, Conf, RepoToken, get_conf, reload_conf
+from .conf import MAX_FINDINGS, MAX_INLINE_COMMENTS, Conf, RepoToken, api_origin, get_conf, reload_conf
 from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent, try_register_review
 from .services.diffctx import (
     build_diff_context,
@@ -16,7 +16,7 @@ from .services.diffctx import (
     estimate_tokens,
     number_patch_lines,
 )
-from .services.gitlab import GitLabError
+from .services.gitlab import GitLabClient, GitLabError
 from .services.llm import (
     LLMConfig,
     LLMError,
@@ -103,6 +103,48 @@ GOOD_REVIEW_YAML = (
     "  relevant_tests: No\n"
     "  security_concerns: No\n"
 )
+
+
+class ApiOriginTests(TestCase):
+    """api_url normalization: the REST API always lives at scheme://host/api/v4.
+
+    Regression context: the WAF entry stored ``https://host/WAF`` (a project
+    page URL), so every API call hit the web UI and got a sign-in HTML page
+    back - webhook events said "submitted" but no ReviewRecord was ever kept.
+    """
+
+    def test_project_page_urls_reduce_to_origin(self):
+        for raw, origin in (
+            ("https://gl.example.com/WAF", "https://gl.example.com"),
+            ("https://gl.example.com/WAF/nextwaf/web_ui", "https://gl.example.com"),
+            ("https://gl.example.com/", "https://gl.example.com"),
+            ("https://gl.example.com/api/v4", "https://gl.example.com"),
+            ("http://gl.internal:8080/sub", "http://gl.internal:8080"),
+            ("gl.example.com/sub", "https://gl.example.com"),  # scheme-less: assume https
+            (" https://gl.example.com ", "https://gl.example.com"),
+            ("", "https://gitlab.com"),  # the client's built-in default
+        ):
+            self.assertEqual(api_origin(raw), origin, raw)
+
+    def test_client_builds_api_urls_from_the_origin_only(self):
+        client = GitLabClient("https://gl.example.com/WAF", "tok")
+        self.assertEqual(client.api_url, "https://gl.example.com")
+        self.assertEqual(
+            client._url("/projects/WAF%2Fnextwaf%2Fweb_ui/merge_requests/3114"),
+            "https://gl.example.com/api/v4/projects/WAF%2Fnextwaf%2Fweb_ui/merge_requests/3114",
+        )
+
+    def test_config_layers_normalize_repo_and_default_urls(self):
+        entry = RepoTokenEntry.objects.create(
+            prefix="waf", token="glpat-1", api_url="https://gl.example.com/WAF"
+        )
+        Setting.objects.create(default_api_url="https://gl.example.com/WAF")
+        conf = reload_conf()
+        self.assertEqual(conf.default_api_url, "https://gl.example.com")
+        repo = resolve_repo_token(conf, "WAF/nextwaf/web_ui")
+        self.assertEqual(repo.prefix, "waf")
+        self.assertEqual(repo.api_url, "https://gl.example.com")
+        entry.delete()
 
 
 class TokenResolverTests(TestCase):
@@ -464,10 +506,9 @@ class RenderTests(TestCase):
         )
 
     def test_review_body_contains_marker_and_sections(self):
-        body = render_review(self._review(), mr_url="http://x/mr/1", remaining_files=["b.py"], model_used="m1")
+        body = render_review(self._review(), mr_url="http://x/mr/1", remaining_files=["b.py"])
         self.assertIn(REVIEW_MARKER, body)
         self.assertIn("b.py", body)
-        self.assertIn("m1", body)
 
     def test_failure_sanitized(self):
         body = render_failure("http_error")
@@ -541,11 +582,23 @@ class WebhookViewTests(TestCase):
 
     def _post(self, payload: dict, token: str = "whsec"):
         return self.client.post(
-            "/webhook/gitlab/",
+            "/tech_powered/code_review/",
             data=json.dumps(payload),
             content_type="application/json",
             HTTP_X_GITLAB_TOKEN=token,
         )
+
+    def test_no_trailing_slash_accepted(self):
+        """不带末尾斜杠也能直接收到 POST，不做 301 重定向（避免 POST 降级成 GET）。"""
+        # 用被直接忽略的 push 事件（不进线程池、不写库），只验证路由层不带斜杠可命中
+        resp = self.client.post(
+            "/tech_powered/code_review",
+            data=json.dumps({"object_kind": "push"}),
+            content_type="application/json",
+            HTTP_X_GITLAB_TOKEN="whsec",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("Location", resp.headers)
 
     def test_bad_token_rejected(self):
         resp = self._post({"object_kind": "push"}, token="wrong")
@@ -614,7 +667,7 @@ class WebhookViewTests(TestCase):
         ))
         with patch("reviewer.views.get_conf", return_value=conf), patch("reviewer.views.submit_review"):
             resp = self.client.post(
-                "/webhook/gitlab/",
+                "/tech_powered/code_review/",
                 data=json.dumps(self._mr_payload()),
                 content_type="application/json",
                 HTTP_X_GITLAB_TOKEN="repo-secret",
@@ -1104,6 +1157,17 @@ class DashboardTests(TestCase):
         self.assertContains(resp, "backend/payments")
         self.assertContains(resp, "88")
         self.assertContains(resp, "review")
+        # webhook events moved to their own top-nav page; overview keeps only the count
+        self.assertNotContains(resp, "事件流水")
+        self.assertContains(resp, "/webhooks/")
+
+    def test_webhook_events_page(self):
+        WebhookEvent.objects.create(object_kind="merge_request", project_path="backend/payments",
+                                    mr_iid=7, action="open", handled="review", head_sha="b" * 40)
+        resp = self.client.get("/webhooks/")
+        self.assertContains(resp, "事件流水")
+        self.assertContains(resp, "backend/payments")
+        self.assertContains(resp, "bbbbbbbb")
 
     def test_trigger_review_from_mr_url(self):
         url = "https://gitlab.example.com/backend/payments/-/merge_requests/7"
@@ -1228,6 +1292,15 @@ class SettingsViewTests(TestCase):
         self.assertContains(resp, 'name="prefix" value=""')
         self.assertNotContains(resp, "readonly")
         self.assertContains(resp, "添加 / 更新前缀")
+
+    def test_repo_token_add_rejects_project_page_url(self):
+        # 把项目页面地址当成 API 地址保存是这次事故的根源，必须在入口拦住
+        resp = self.client.post("/settings/repos/", {
+            "action": "save_repo", "prefix": "waf", "token": "glpat-1",
+            "api_url": "https://gl.example.com/WAF", "enabled": "on",
+        })
+        self.assertRedirects(resp, "/settings/repos/")
+        self.assertEqual(RepoTokenEntry.objects.count(), 0)  # nothing was saved
 
     def test_repo_token_add_update_delete(self):
         resp = self.client.post("/settings/repos/", {

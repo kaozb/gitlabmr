@@ -80,3 +80,7 @@ node_modules/
 *.bak
 *.orig
 *.tmp
+
+# 本地产物
+scripts/token_check_results.txt
+token_check_results.txt

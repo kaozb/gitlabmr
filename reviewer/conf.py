@@ -14,6 +14,7 @@ import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 
@@ -60,6 +61,24 @@ def normalize_prefix(value: str) -> str:
     comparable with any casing written in the config.
     """
     return str(value or "").strip().strip("/").lower()
+
+
+def api_origin(url: str) -> str:
+    """Reduce a configured GitLab address to ``scheme://host``.
+
+    The REST API always lives at ``<origin>/api/v4``, but repo-token entries
+    often carry a project/group *page* URL like ``https://host/WAF`` - a habit
+    imported from GitLab's project webhooks. Appending ``/api/v4`` to such a
+    path never reaches the API: GitLab's router falls through to the web UI and
+    answers with a sign-in HTML page, which then breaks every call. Only the
+    scheme://host part is meaningful for API access; a scheme-less input is
+    assumed https.
+    """
+    value = (url or "").strip() or "https://gitlab.com"
+    parsed = urlparse(value if "://" in value else f"https://{value}")
+    if not parsed.netloc:  # nothing usable - keep the (trimmed) input as-is
+        return value.rstrip("/")
+    return f"{parsed.scheme or 'https'}://{parsed.netloc}"
 
 
 @dataclass(frozen=True)
@@ -118,7 +137,7 @@ def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
         tokens.append(
             RepoToken(
                 prefix=prefix,
-                api_url=str(entry.get("api_url", "")).strip().rstrip("/"),
+                api_url=api_origin(entry.get("api_url", "")),
                 token=token,
                 webhook_secret=(str(entry["webhook_secret"]).strip() if entry.get("webhook_secret") else None),
             )
@@ -143,7 +162,7 @@ def _load_repo_tokens() -> tuple[RepoToken, ...]:
 def _load_env_conf() -> Conf:
     return Conf(
         webhook_secret=_env("GITLABMR_WEBHOOK_SECRET"),
-        default_api_url=_env("GITLABMR_GITLAB_URL", "https://gitlab.com").rstrip("/"),
+        default_api_url=api_origin(_env("GITLABMR_GITLAB_URL", "https://gitlab.com")),
         default_token=_env("GITLABMR_GITLAB_TOKEN"),
         repo_tokens=_load_repo_tokens(),
         llm_base_url=_env("GITLABMR_LLM_BASE_URL").rstrip("/"),
@@ -227,8 +246,15 @@ def _apply_db_overrides(conf: Conf) -> Conf:
             if value is not None:
                 updates[name] = value
 
+    # The dashboard stores whatever the admin typed; the same project-page-URL
+    # trap applies to the default address (see api_origin) - normalize before
+    # anything consumes it, including the per-entry fallback below.
+    if updates.get("default_api_url"):
+        updates["default_api_url"] = api_origin(updates["default_api_url"])
+
     if token_entries:
         db_tokens = []
+        fallback_url = updates.get("default_api_url") or conf.default_api_url
         for entry in token_entries:
             prefix = normalize_prefix(entry.prefix)
             if not prefix:  # a blank prefix would swallow every project path
@@ -237,7 +263,7 @@ def _apply_db_overrides(conf: Conf) -> Conf:
             db_tokens.append(
                 RepoToken(
                     prefix=prefix,
-                    api_url=(entry.api_url or conf.default_api_url).rstrip("/"),
+                    api_url=api_origin(entry.api_url or fallback_url),
                     token=entry.token,
                     webhook_secret=entry.webhook_secret or None,
                 )

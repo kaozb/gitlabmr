@@ -172,7 +172,28 @@ def dashboard(request):
             stats=stats,
             summary=summary,
             reviews=ReviewRecord.objects.all()[:50],
-            events=WebhookEvent.objects.all()[:20],
+        ),
+    )
+
+
+@ui_login_required
+def webhook_events(request):
+    """Standalone page: webhook audit log (only first "open" per MR is stored)."""
+    handled_counts = dict(WebhookEvent.objects.values_list("handled").annotate(n=Count("id")))
+    # fixed order so the stat cards don't jump around as data changes
+    stat_order = (("review", "ok"), ("error", "err"), ("rejected", ""), ("ignored", "idle"), ("received", ""))
+    handled_stats = [
+        (handled, label, handled_counts.get(handled, 0))
+        for handled, label in stat_order
+    ]
+    return render(
+        request,
+        "reviewer/webhook_events.html",
+        _base_ctx(
+            request,
+            events=WebhookEvent.objects.all()[:200],
+            total=WebhookEvent.objects.count(),
+            handled_stats=handled_stats,
         ),
     )
 
@@ -374,8 +395,18 @@ def _save_repo_token(request):
         if conflict:
             messages.error(request, f"前缀 {prefix} 已被其他配置占用，请换一个")
             return redirect("reviewer:settings-repos")
+    from .conf import api_origin
+
+    raw_api_url = (request.POST.get("api_url") or "").strip().rstrip("/")
+    if raw_api_url and api_origin(raw_api_url) != raw_api_url:
+        messages.error(
+            request,
+            f"API 地址请填 GitLab 实例根地址（如 https://gitlab.example.com），不要带项目路径：{raw_api_url}"
+            f"（REST API 固定在 {api_origin(raw_api_url)}/api/v4，带路径会被路由到网页登录页）",
+        )
+        return redirect("reviewer:settings-repos")
     fields = {
-        "api_url": (request.POST.get("api_url") or "").strip().rstrip("/"),
+        "api_url": raw_api_url,
         "webhook_secret": (request.POST.get("webhook_secret") or "").strip(),
         "note": (request.POST.get("note") or "").strip(),
         "enabled": request.POST.get("enabled") == "on",

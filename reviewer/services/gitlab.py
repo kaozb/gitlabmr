@@ -17,6 +17,8 @@ from urllib.parse import quote
 
 import requests
 
+from ..conf import api_origin
+
 logger = logging.getLogger("gitlabmr.gitlab")
 
 
@@ -32,7 +34,10 @@ def _mask(token: str) -> str:
 
 class GitLabClient:
     def __init__(self, api_url: str, token: str, timeout: int = 15):
-        self.api_url = (api_url or "https://gitlab.com").rstrip("/")
+        # The API always lives at <origin>/api/v4; normalize away any path the
+        # entry carried (see conf.api_origin) so a project page URL can never
+        # silently route requests to the web UI instead of the REST endpoint.
+        self.api_url = api_origin(api_url)
         self.token = token
         self.timeout = timeout
         self._session = requests.Session()
