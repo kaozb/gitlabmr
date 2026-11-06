@@ -38,40 +38,14 @@ def get_tokens_from_db():
 
 
 def check_token(token, api_url):
-    """
-    验证单个 GitLab 令牌是否有效
+    """验证单个 GitLab 令牌是否有效（复用 web 端同一实现，避免两处逻辑漂移）。
+
     返回: (is_valid, message, user_info)
     """
-    try:
-        # 构建 API 端点 - 使用 /api/v4/user 获取当前用户信息
-        url = f"{api_origin(api_url)}/api/v4/user"
-        
-        headers = {
-            'PRIVATE-TOKEN': token
-        }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            user = response.json()
-            return True, "有效", {
-                'username': user.get('username', 'N/A'),
-                'name': user.get('name', 'N/A'),
-                'id': user.get('id', 'N/A')
-            }
-        elif response.status_code == 401:
-            return False, "无效（401 Unauthorized）", None
-        elif response.status_code == 403:
-            return False, "无权限（403 Forbidden）", None
-        else:
-            return False, f"错误（HTTP {response.status_code}）", None
-            
-    except requests.exceptions.Timeout:
-        return False, "超时（10秒）", None
-    except requests.exceptions.ConnectionError as e:
-        return False, f"连接失败: {str(e)}", None
-    except Exception as e:
-        return False, f"异常: {str(e)}", None
+    from reviewer.services.gitlab import probe_token
+
+    valid, message, owner = probe_token(api_url, token, timeout=10)
+    return valid, message, ({"username": owner} if valid and owner else None)
 
 
 def main():
@@ -113,7 +87,7 @@ def main():
             status_icon = "✅"
             print(f"       结果: {status_icon} {message}")
             if user_info:
-                print(f"       用户: {user_info['name']} (@{user_info['username']})")
+                print(f"       用户: @{user_info['username']}")
         else:
             invalid_count += 1
             status_icon = "❌"
@@ -153,7 +127,7 @@ def main():
         for r in results:
             if r['valid']:
                 user = r['user_info']
-                print(f"  - {r['product'] or r['api_url']}: {user['name']} (@{user['username']})")
+                print(f"  - {r['product'] or r['api_url']}: @{user['username']}")
         print()
     
     # 导出结果到文件
@@ -177,7 +151,7 @@ def main():
             f.write(f"状态: {'✅ 有效' if r['valid'] else '❌ 无效'}\n")
             f.write(f"详情: {r['message']}\n")
             if r['user_info']:
-                f.write(f"用户: {r['user_info']['name']} (@{r['user_info']['username']})\n")
+                f.write(f"用户: @{r['user_info']['username']}\n")
             f.write("\n")
     
     print(f"💾 详细结果已保存到: {output_file}")

@@ -1348,6 +1348,33 @@ class DashboardTests(TestCase):
         self.assertNotContains(resp, "事件流水")
         self.assertContains(resp, "/webhooks/")
 
+    # ---- 首页评审记录真分页（与 /webhooks/ 同一套逻辑） ----
+
+    def test_dashboard_reviews_pagination_slices_queryset(self):
+        """真实分页：每页只出 50 条，数据库里其余记录不出现在本页响应中。"""
+        for i in range(120):
+            self._record(project_path=f"p/{i}", mr_iid=i, head_sha=f"{i:040x}")
+        first = self.client.get("/")
+        self.assertEqual(len(first.context["reviews"]), 50)
+        self.assertEqual(first.context["total"], 120)
+        self.assertNotContains(first, "p/69")   # 第 51 名起的旧记录不在第 1 页
+        self.assertContains(first, "p/119")     # 最新记录（默认 -created_at 排序）在第 1 页
+
+        second = self.client.get("/?page=2")
+        self.assertEqual(len(second.context["reviews"]), 50)
+        self.assertNotContains(second, "p/119")
+        self.assertContains(second, "p/69")     # 第 51-100 名落在第 2 页
+
+        self.assertEqual(len(self.client.get("/?page=3").context["reviews"]), 20)
+
+    def test_dashboard_reviews_page_falls_back_on_bad_input(self):
+        """非法页码回落第 1 页，越界页码回落最后一页，不抛 404/500。"""
+        self._record()
+        self.assertEqual(self.client.get("/?page=abc").context["page_obj"].number, 1)
+        self.assertEqual(self.client.get("/?page=-2").context["page_obj"].number, 1)
+        self.assertEqual(self.client.get("/?page=999").context["page_obj"].number, 1)
+        self.assertEqual(self.client.get("/?page=0").context["page_obj"].number, 1)
+
     def test_webhook_events_page(self):
         WebhookEvent.objects.create(object_kind="merge_request", project_path="backend/payments",
                                     mr_iid=7, action="open", handled="review", head_sha="b" * 40)
@@ -1355,6 +1382,35 @@ class DashboardTests(TestCase):
         self.assertContains(resp, "事件流水")
         self.assertContains(resp, "backend/payments")
         self.assertContains(resp, "bbbbbbbb")
+
+    # ---- /webhooks/ 真分页 ----
+
+    def test_webhook_events_pagination_slices_queryset(self):
+        """真实分页：每页只出 50 条，数据库里其余记录不出现在本页响应中。"""
+        for i in range(120):
+            WebhookEvent.objects.create(object_kind="merge_request", project_path=f"p/{i}",
+                                        action="open", handled="review")
+        first = self.client.get("/webhooks/")
+        self.assertEqual(len(first.context["events"]), 50)
+        self.assertEqual(first.context["total"], 120)
+        self.assertNotContains(first, "p/69")   # 第 51 名（p/69）起的旧记录不在第 1 页
+        self.assertContains(first, "p/119")     # 最新记录（默认 -created_at 排序）在第 1 页
+
+        second = self.client.get("/webhooks/?page=2")
+        self.assertEqual(len(second.context["events"]), 50)
+        self.assertNotContains(second, "p/119")
+        self.assertContains(second, "p/69")     # 第 51-100 名：p/69..p/20
+
+        self.assertEqual(len(self.client.get("/webhooks/?page=3").context["events"]), 20)
+
+    def test_webhook_events_page_falls_back_on_bad_input(self):
+        """非法页码回落第 1 页，越界页码回落最后一页，不抛 404/500。"""
+        WebhookEvent.objects.create(object_kind="merge_request", project_path="p/x",
+                                    action="open", handled="review")
+        self.assertEqual(self.client.get("/webhooks/?page=abc").context["page_obj"].number, 1)
+        self.assertEqual(self.client.get("/webhooks/?page=-2").context["page_obj"].number, 1)
+        self.assertEqual(self.client.get("/webhooks/?page=999").context["page_obj"].number, 1)
+        self.assertEqual(self.client.get("/webhooks/?page=0").context["page_obj"].number, 1)
 
     def test_trigger_review_from_mr_url(self):
         url = "https://gitlab.example.com/backend/payments/-/merge_requests/7"
@@ -1587,3 +1643,102 @@ class SettingsViewTests(TestCase):
         })
         self.assertRedirects(resp, "/settings/repos/")
         self.assertEqual(RepoTokenEntry.objects.count(), 0)
+
+    # -- token probe / one-click disable ------------------------------------
+
+    @staticmethod
+    def _probe_response(status, username="bot"):
+        resp = MagicMock(status_code=status)
+        resp.json.return_value = {"username": username}
+        return resp
+
+    def test_probe_tokens_marks_entries(self):
+        good = RepoTokenEntry.objects.create(product="G", token="glpat-good",
+                                             api_url="https://gitlab.example.com/g")
+        RepoTokenEntry.objects.create(product="B", token="glpat-dead",
+                                      api_url="https://gitlab.example.com/b", enabled=False)
+
+        def fake_get(url, headers=None, timeout=None):
+            if headers.get("PRIVATE-TOKEN") == "glpat-good":
+                return self._probe_response(200, "bot-account")
+            return self._probe_response(401)
+
+        with patch("reviewer.services.gitlab.requests.get", side_effect=fake_get):
+            resp = self.client.post("/settings/repos/", {"action": "probe_tokens"})
+        self.assertRedirects(resp, "/settings/repos/")
+        good.refresh_from_db()
+        self.assertEqual(good.enabled, True)
+        self.assertEqual(RepoTokenEntry.objects.get(pk=good.pk).enabled, True)
+
+    def test_probe_sorts_dead_entries_to_bottom(self):
+        """⚡ probe re-renders the table with the rejected token as the last row.
+
+        Natural order is alphabetical by product; sorting is stable, so only
+        the dead entry moves (to the very bottom) in each round.
+        """
+        first = RepoTokenEntry.objects.create(product="F", token="glpat-f",
+                                              api_url="https://gitlab.example.com/f")
+        last = RepoTokenEntry.objects.create(product="L", token="glpat-l",
+                                             api_url="https://gitlab.example.com/l")
+        dead = RepoTokenEntry.objects.create(product="D", token="glpat-d",
+                                             api_url="https://gitlab.example.com/d")
+
+        def fake_get(url, headers=None, timeout=None):
+            ok = headers.get("PRIVATE-TOKEN") != "glpat-d"
+            return self._probe_response(200 if ok else 401)
+
+        with patch("reviewer.services.gitlab.requests.get", side_effect=fake_get):
+            self.client.post("/settings/repos/", {"action": "probe_tokens"})
+        resp = self.client.get("/settings/repos/")
+        rows = resp.context["repo_entries"]
+        self.assertEqual(rows[-1].pk, dead.pk)  # dead token sunk to the bottom
+        self.assertContains(resp, 'class="row-dead"')  # dimmed via template hook
+
+        # the same guarantee holds when a different entry dies next round
+        def fake_get2(url, headers=None, timeout=None):
+            ok = headers.get("PRIVATE-TOKEN") != "glpat-l"
+            return self._probe_response(200 if ok else 401)
+
+        with patch("reviewer.services.gitlab.requests.get", side_effect=fake_get2):
+            self.client.post("/settings/repos/", {"action": "probe_tokens"})
+        rows = self.client.get("/settings/repos/").context["repo_entries"]
+        self.assertEqual(rows[-1].pk, last.pk)
+        self.assertEqual([e.pk for e in rows[:2]], sorted([first.pk, dead.pk],
+                         key=lambda pk: RepoTokenEntry.objects.get(pk=pk).product))
+
+    def test_disable_dead_tokens_only_touches_rejected(self):
+        dead = RepoTokenEntry.objects.create(product="D", token="glpat-dead",
+                                             api_url="https://gitlab.example.com/d", note="原有备注")
+        unreachable = RepoTokenEntry.objects.create(product="U", token="glpat-u",
+                                                    api_url="https://gitlab.example.com/u")
+        healthy = RepoTokenEntry.objects.create(product="H", token="glpat-ok",
+                                                api_url="https://gitlab.example.com/h")
+
+        def fake_get(url, headers=None, timeout=None):
+            token = headers.get("PRIVATE-TOKEN")
+            if token == "glpat-dead":
+                return self._probe_response(401)
+            if token == "glpat-u":  # network failure: cannot judge, must NOT disable
+                raise ConnectionError("boom")
+            return self._probe_response(200)
+
+        with patch("reviewer.services.gitlab.requests.get", side_effect=fake_get):
+            resp = self.client.post("/settings/repos/", {"action": "disable_dead_tokens"})
+        self.assertRedirects(resp, "/settings/repos/")
+        dead.refresh_from_db()
+        unreachable.refresh_from_db()
+        healthy.refresh_from_db()
+        self.assertEqual(dead.enabled, False)  # 401 -> disabled
+        self.assertIn("[已自动禁用：令牌探测无效]", dead.note)
+        self.assertIn("原有备注", dead.note)  # original note kept
+        self.assertEqual(unreachable.enabled, True)  # network error ≠ dead
+        self.assertEqual(healthy.enabled, True)
+
+    def test_disable_dead_tokens_none_dead(self):
+        RepoTokenEntry.objects.create(product="H", token="glpat-ok",
+                                      api_url="https://gitlab.example.com/h")
+        with patch("reviewer.services.gitlab.requests.get",
+                   return_value=self._probe_response(200)):
+            resp = self.client.post("/settings/repos/", {"action": "disable_dead_tokens"})
+        self.assertRedirects(resp, "/settings/repos/")
+        self.assertEqual(RepoTokenEntry.objects.get().enabled, True)

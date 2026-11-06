@@ -47,6 +47,11 @@
     td { padding: 9px 10px; border-bottom: 1px solid #f0f2f7; vertical-align: middle; }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: #fafbfe; }
+    tr.row-dead td { opacity: 0.5; }  /* probe-rejected tokens, sunk to bottom */
+    tr.row-dead:hover td { opacity: 0.85; }
+    .pager { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 14px; justify-content: center; }
+    .pager .dots { color: var(--muted); padding: 0 2px; user-select: none; }
+    .pager .btn.current { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 700; cursor: default; }
     .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
     .badge.success { background: var(--ok-bg); color: var(--ok); }
     .badge.failed { background: var(--err-bg); color: var(--err); }

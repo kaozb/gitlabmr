@@ -32,6 +32,38 @@ def _mask(token: str) -> str:
     return (token[:8] + "...") if len(token) > 8 else "***"
 
 
+def probe_token(api_url: str, token: str, timeout: int = 10) -> tuple[bool, str, str]:
+    """Probe whether a token is accepted by ``GET /api/v4/user``.
+
+    Returns ``(valid, message, owner)`` where ``owner`` is the login name of
+    the account the token belongs to (empty when the probe failed).
+
+    Only 401/403 mean the token is *definitively* rejected; timeouts, DNS
+    failures and 5xx are network/server conditions and must never be treated
+    as "token dead" (callers rely on that to avoid disabling live tokens).
+    """
+    if not token:
+        return False, "未配置令牌", ""
+    try:
+        resp = requests.get(
+            f"{api_origin(api_url)}/api/v4/user",
+            headers={"PRIVATE-TOKEN": token},
+            timeout=timeout,
+        )
+    except requests.RequestException as exc:
+        return False, f"网络异常（{exc.__class__.__name__}），无法判定", ""
+    if resp.status_code == 200:
+        try:
+            owner = resp.json().get("username", "") or ""
+        except ValueError:
+            owner = ""
+        return True, "有效", owner
+    if resp.status_code in (401, 403):
+        reason = "令牌已失效/被吊销" if resp.status_code == 401 else "令牌无 API 权限"
+        return False, f"无效（{resp.status_code} {reason}）", ""
+    return False, f"服务异常（HTTP {resp.status_code}），无法判定", ""
+
+
 class GitLabClient:
     def __init__(self, api_url: str, token: str, timeout: int = 15):
         # The API always lives at <origin>/api/v4; normalize away any path the

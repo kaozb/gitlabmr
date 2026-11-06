@@ -3,7 +3,8 @@
 Pages:
 - ``/``                overview: stats, review records, webhook events, manual trigger
 - ``/settings/llm/``   LLM + review-behavior settings (saved to DB, wins over env)
-- ``/settings/repos/`` GitLab connection defaults + per-prefix repo tokens
+- ``/settings/repos/`` GitLab connection defaults + per-repo product tokens
+  (probe validity, one-click disable of tokens rejected by GitLab)
 - ``/reviews/<pk>/``          one review attempt in full detail (pipeline flowchart)
 - ``/reviews/<pk>/retry/``    force re-run of that review
 - ``/login/``, ``/logout/``   密码后备通道（GITLABMR_UI_PASSWORD，应急用）；
@@ -18,6 +19,8 @@ from functools import wraps
 from urllib.parse import quote, urlparse
 
 from django.contrib import messages
+from django.core.paginator import EmptyPage, Paginator
+from django.core.paginator import PageNotAnInteger as _PageNotAnInteger
 from django.db.models import Count
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.http import url_has_allowed_host_and_scheme
@@ -28,6 +31,8 @@ from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
 from .services.mrref import MRRefError, parse_mr_ref
 from .services.pipeline import submit_review
 from .services.tokens import resolve_repo_token
+
+PROBE_RESULTS_KEY = "repo_token_probe"  # session key: last token-probe outcome
 
 SECRET_FIELDS = ("webhook_secret", "default_token", "llm_api_key")
 BOOL_FIELDS = ("inline_comments", "review_on_push")
@@ -182,6 +187,14 @@ def dashboard(request):
         ("行内评论", "开" if conf.inline_comments else "关", True),
         ("推送触发", "开" if conf.review_on_push else "关", True),
     ]
+    # 评审记录真分页：与 webhook 事件页同一套逻辑（Paginator 数据库层 LIMIT/OFFSET）
+    paginator = Paginator(ReviewRecord.objects.all(), PAGE_SIZE)
+    try:
+        page = paginator.page(int(request.GET.get("page", "1") or 1))
+    except (ValueError, _PageNotAnInteger):
+        page = paginator.page(1)
+    except EmptyPage:
+        page = paginator.page(paginator.num_pages)
     return render(
         request,
         "reviewer/dashboard.html",
@@ -189,9 +202,31 @@ def dashboard(request):
             request,
             stats=stats,
             summary=summary,
-            reviews=ReviewRecord.objects.all()[:50],
+            page_obj=page,
+            reviews=page.object_list,
+            page_items=_page_items(paginator.num_pages, page.number),
+            total=paginator.count,
         ),
     )
+
+
+PAGE_SIZE = 50  # 评审记录 / webhook 流水共用：每页条数（后端真实分页，非前端截断）
+
+
+def _page_items(num_pages: int, current: int) -> list[tuple[str, int]]:
+    """分页条目序列：首页/末页 + 当前页±2，跨度大于 1 的缺口插入 ("gap", 0) 表示省略号。
+
+    例：num_pages=20, current=8 → [(page,1),(gap,0),(page,6)..(page,10),(gap,0),(page,20)]
+    """
+    if num_pages <= 7:
+        return [("page", n) for n in range(1, num_pages + 1)]
+    numbers = sorted({1, num_pages} | set(range(max(1, current - 2), min(num_pages, current + 2) + 1)))
+    items: list[tuple[str, int]] = []
+    for n in numbers:
+        if items and n - items[-1][1] > 1:
+            items.append(("gap", 0))
+        items.append(("page", n))
+    return items
 
 
 @ui_login_required
@@ -204,13 +239,23 @@ def webhook_events(request):
         (handled, label, handled_counts.get(handled, 0))
         for handled, label in stat_order
     ]
+    # 真分页： Paginator 在数据库层 LIMIT/OFFSET 取数，事件再多也只查本页 50 条
+    paginator = Paginator(WebhookEvent.objects.all(), PAGE_SIZE)
+    try:
+        page = paginator.page(int(request.GET.get("page", "1") or 1))
+    except (ValueError, _PageNotAnInteger):
+        page = paginator.page(1)
+    except EmptyPage:
+        page = paginator.page(paginator.num_pages)
     return render(
         request,
         "reviewer/webhook_events.html",
         _base_ctx(
             request,
-            events=WebhookEvent.objects.all()[:200],
-            total=WebhookEvent.objects.count(),
+            page_obj=page,
+            events=page.object_list,
+            page_items=_page_items(paginator.num_pages, page.number),
+            total=paginator.count,
             handled_stats=handled_stats,
         ),
     )
@@ -369,6 +414,71 @@ def settings_llm_view(request):
     )
 
 
+def _probe_results() -> dict[str, tuple[bool, str, str]]:
+    """Probe every *enabled* token concurrently; keyed by normalized api_url.
+
+    Returns ``{api_url: (valid, message, owner)}``; disabled entries are
+    skipped (they are out of the matching pool anyway).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .services.gitlab import probe_token
+
+    entries = list(RepoTokenEntry.objects.filter(enabled=True))
+    if not entries:
+        return {}
+
+    def _one(entry: RepoTokenEntry) -> tuple[str, tuple[bool, str, str]]:
+        try:
+            valid, message, owner = probe_token(entry.api_url, entry.token, timeout=10)
+        except Exception as exc:  # a single broken probe must not kill the whole batch
+            valid, message, owner = False, f"探测异常（{exc.__class__.__name__}），无法判定", ""
+        return entry.api_url, (valid, message, owner)
+
+    with ThreadPoolExecutor(max_workers=min(8, len(entries))) as pool:
+        return dict(pool.map(_one, entries))
+
+
+def _store_probe_results(request) -> dict[int, int]:
+    """Run the probe and remember the outcome in the session for re-display."""
+    results = _probe_results()
+    ok = sum(1 for valid, _, _ in results.values() if valid)
+    # store (valid, message, owner) keyed by api_url; session holds plain JSON
+    request.session[PROBE_RESULTS_KEY] = {
+        url: {"valid": v, "msg": m, "owner": o} for url, (v, m, o) in results.items()
+    }
+    request.session.modified = True
+    return {"total": len(results), "ok": ok, "dead": len(results) - ok}
+
+
+def _is_dead(info: dict) -> bool:
+    """True only when GitLab explicitly rejected the token (401/403).
+
+    Network timeouts / 5xx / unexpected errors are "cannot judge", not dead.
+    """
+    return bool(info) and not info["valid"] and "无效（" in info["msg"]
+
+
+def _sort_repo_entries(entries: list[RepoTokenEntry], request) -> list[RepoTokenEntry]:
+    """Order the table: enabled first, dead tokens sunk to the very bottom.
+
+    Probe outcome comes from the session (last ⚡ run); entries never probed
+    keep their natural position inside their group.
+    """
+    stored = request.session.get(PROBE_RESULTS_KEY) or {}
+    dead_ids: set[int] = set()
+    for entry in entries:
+        if _is_dead(stored.get(entry.api_url)):
+            dead_ids.add(entry.pk)
+    entries.sort(
+        key=lambda e: (
+            not e.enabled,  # disabled entries second-to-bottom
+            e.pk in dead_ids,  # explicitly-dead tokens at the very bottom
+        )
+    )
+    return entries
+
+
 @ui_login_required
 def settings_repos_view(request):
     conf = get_conf()
@@ -386,6 +496,39 @@ def settings_repos_view(request):
             else:
                 messages.error(request, f"未找到令牌配置：{api_url}")
             return redirect("reviewer:settings-repos")
+        if action == "probe_tokens":
+            stats = _store_probe_results(request)
+            unreachable = stats["total"] - stats["ok"] - stats["dead"]
+            summary = f"探测完成：{stats['total']} 个启用令牌中 {stats['ok']} 个有效"
+            if stats["dead"]:
+                summary += f"、{stats['dead']} 个已失效"
+            if unreachable:
+                summary += f"、{unreachable} 个无法判定（网络/服务异常）"
+            messages.success(request, summary)
+            return redirect("reviewer:settings-repos")
+        if action == "disable_dead_tokens":
+            stats = _store_probe_results(request)  # re-probe first: never stale
+            stored = request.session[PROBE_RESULTS_KEY]
+            rejected = {  # only GitLab-rejected tokens; unknown (network/5xx) ≠ dead
+                url for url, info in stored.items() if _is_dead(info)
+            }
+            dead = [e for e in RepoTokenEntry.objects.filter(enabled=True) if e.api_url in rejected]
+            for entry in dead:
+                entry.enabled = False
+                entry.note = (entry.note + "；" if entry.note else "") + "[已自动禁用：令牌探测无效]"
+                entry.save(update_fields=["enabled", "note"])
+            reload_conf()
+            if dead:
+                names = "、".join((e.product or e.api_url) for e in dead[:5])
+                if len(dead) > 5:
+                    names += f" 等 {len(dead)} 条"
+                messages.warning(
+                    request,
+                    f"已禁用 {len(dead)} 个失效令牌：{names}；网络异常/服务异常的条目保持原状（无法判定≠失效）",
+                )
+            else:
+                messages.success(request, "没有需要禁用的条目：没有令牌被 GitLab 明确拒绝（401/403）")
+            return redirect("reviewer:settings-repos")
         _apply_setting_post(request.POST, setting or Setting(), REPO_SETTING_GROUPS)
         reload_conf()
         messages.success(request, "GitLab 连接设置已保存并立即生效")
@@ -398,6 +541,10 @@ def settings_repos_view(request):
     repo_entries = list(RepoTokenEntry.objects.all())
     for entry in repo_entries:
         entry.masked_token = mask_secret(entry.token)
+    _sort_repo_entries(repo_entries, request)
+    stored = request.session.get(PROBE_RESULTS_KEY) or {}
+    for entry in repo_entries:  # template hook: dim rows of rejected tokens
+        entry.is_dead = _is_dead(stored.get(entry.api_url))
     return render(
         request,
         "reviewer/settings.html",

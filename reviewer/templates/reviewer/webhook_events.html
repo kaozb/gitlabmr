@@ -17,7 +17,7 @@
 <div class="card" style="margin-top:20px">
   <div class="card-head">
     <h2>事件流水</h2>
-    <span class="muted">最近 200 条</span>
+    <span class="muted">共 {{ total }} 条 · 第 {{ page_obj.number }} / {{ page_obj.paginator.num_pages }} 页 · 每页 50 条</span>
   </div>
   {% if events %}
   <table>
@@ -38,5 +38,27 @@
     </tbody>
   </table>
   {% else %}<div class="empty">尚未收到任何 Webhook 事件 —— 确认 GitLab 仓库已配置指向 <span class="mono">/tech_powered/code_review/</span> 的 Webhook</div>{% endif %}
+
+  {% if page_obj.has_other_pages %}
+  <div class="pager">
+    {% if page_obj.has_previous %}
+    <a class="btn small" href="?page={{ page_obj.previous_page_number }}">‹ 上一页</a>
+    {% else %}<span class="btn small" style="visibility:hidden">‹ 上一页</span>{% endif %}
+
+    {% for kind, num in page_items %}
+    {% if kind == "gap" %}
+    <span class="dots">…</span>
+    {% elif num == page_obj.number %}
+    <span class="btn small current">{{ num }}</span>
+    {% else %}
+    <a class="btn small" href="?page={{ num }}">{{ num }}</a>
+    {% endif %}
+    {% endfor %}
+
+    {% if page_obj.has_next %}
+    <a class="btn small" href="?page={{ page_obj.next_page_number }}">下一页 ›</a>
+    {% else %}<span class="btn small" style="visibility:hidden">下一页 ›</span>{% endif %}
+  </div>
+  {% endif %}
 </div>
 {% endblock %}
