@@ -9,6 +9,7 @@ urlpatterns = [
     path("", ui.dashboard, name="dashboard"),
     path("webhooks/", ui.webhook_events, name="webhook-events"),
     path("settings/llm/", ui.settings_llm_view, name="settings-llm"),
+    path("settings/prompts/", ui.settings_prompts_view, name="settings-prompts"),
     path("settings/repos/", ui.settings_repos_view, name="settings-repos"),
     path("settings/", RedirectView.as_view(pattern_name="reviewer:settings-llm", permanent=False), name="settings"),
     path("login/", ui.ui_login, name="login"),

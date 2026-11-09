@@ -113,12 +113,89 @@ CONTEXT_PROTOCOL_TEMPLATE = """Context request protocol (active for this review)
 """
 
 
+CONTEXT_EXHAUSTED_NOTE = """## Note
+The context request budget is exhausted - no further repository content can
+be fetched. You MUST now answer with the final review YAML schema based on
+the information you already have. Do NOT answer with need_context."""
+
+
 def build_system_prompt(num_max_findings: int, language: str, allow_context_requests: bool = False) -> str:
-    schema = SCHEMA_TEMPLATE.format(num_max_findings=num_max_findings)
-    prompt = SYSTEM_TEMPLATE.format(language=language, schema=schema)
+    schema = render_template("schema", SCHEMA_TEMPLATE, num_max_findings=num_max_findings)
+    prompt = render_template("system", SYSTEM_TEMPLATE, language=language, schema=schema)
     if allow_context_requests:
-        prompt += "\n" + CONTEXT_PROTOCOL_TEMPLATE.format(language=language)
+        prompt += "\n" + render_template("context_protocol", CONTEXT_PROTOCOL_TEMPLATE, language=language)
     return prompt
+
+
+def get_prompt_override(name: str) -> str:
+    """DB-stored custom template text for a stage; ``""`` when missing/blank.
+
+    Lazy model import (same pattern as conf.py) keeps this module importable
+    before the app registry is ready.
+    """
+    try:
+        from ..models import PromptTemplate
+
+        return (PromptTemplate.objects.filter(name=name).values_list("content", flat=True).first() or "")
+    except Exception:  # noqa: BLE001 - template lookup must never break a review
+        return ""
+
+
+def render_template(name: str, default: str, **variables) -> str:
+    """Effective template text: a non-blank DB override wins, else the default.
+
+    Placeholders are substituted via literal token replacement, not
+    ``str.format`` - custom templates may contain arbitrary braces (YAML
+    examples etc.) that would crash format().
+    """
+    text = get_prompt_override(name).strip() or default
+    for key, value in variables.items():
+        text = text.replace("{" + key + "}", str(value))
+    return text
+
+
+def context_exhausted_note() -> str:
+    """Appended when the need_context fetch budget is spent."""
+    return render_template("context_exhausted", CONTEXT_EXHAUSTED_NOTE)
+
+
+# Dashboard-managed prompt stages (/settings/prompts/): UI metadata only, the
+# actual defaults are the constants above. A non-blank PromptTemplate row with
+# the same name wins; "恢复默认" deletes the row.
+PROMPT_STAGES = (
+    {
+        "name": "system",
+        "title": "system 提示词（评审角色与规则）",
+        "description": "所有评审共用的 system 段：判断规则、证据要求、上下文边界与不可信数据声明。",
+        "variables": ("language", "schema"),
+        "required": ("language", "schema"),
+        "default": SYSTEM_TEMPLATE,
+    },
+    {
+        "name": "schema",
+        "title": "输出 YAML schema",
+        "description": "模型必须返回的 YAML 结构契约，渲染后拼入 system 末尾。",
+        "variables": ("num_max_findings",),
+        "required": ("num_max_findings",),
+        "default": SCHEMA_TEMPLATE,
+    },
+    {
+        "name": "context_protocol",
+        "title": "need_context 协议（主动补上下文）",
+        "description": "开启主动补上下文后追加到 system，约定模型如何索要文件/符号。",
+        "variables": ("language",),
+        "required": ("language",),
+        "default": CONTEXT_PROTOCOL_TEMPLATE,
+    },
+    {
+        "name": "context_exhausted",
+        "title": "补上下文预算耗尽说明",
+        "description": "追加到 user 提示词末尾，预算用尽时强制作答最终评审；无占位符。",
+        "variables": (),
+        "required": (),
+        "default": CONTEXT_EXHAUSTED_NOTE,
+    },
+)
 
 
 def build_user_prompt(

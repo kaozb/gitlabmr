@@ -28,9 +28,10 @@ from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
 from .conf import MAX_INLINE_COMMENTS, get_conf, normalize_match_url, reload_conf
-from .models import IssueFeedback, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
+from .models import IssueFeedback, PromptTemplate, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
 from .services.mrref import MRRefError, parse_mr_ref
 from .services.pipeline import submit_review
+from .services.prompts import PROMPT_STAGES
 from .services.tokens import resolve_repo_token
 
 PROBE_RESULTS_KEY = "repo_token_probe"  # session key: last token-probe outcome
@@ -510,6 +511,53 @@ def _apply_setting_post(post: dict, setting: Setting, groups_spec) -> None:
             else:
                 setattr(setting, name, raw)
     setting.save()
+
+
+@ui_login_required
+def settings_prompts_view(request):
+    """View/manage per-stage prompt templates (code default vs DB override)."""
+    if request.method == "POST":
+        name = request.POST.get("name") or ""
+        action = request.POST.get("action") or ""
+        stage = next((s for s in PROMPT_STAGES if s["name"] == name), None)
+        if stage is None:
+            messages.error(request, "未知的提示词阶段")
+            return redirect("reviewer:settings-prompts")
+        if action == "restore":
+            deleted, _ = PromptTemplate.objects.filter(name=name).delete()
+            messages.success(
+                request,
+                f"已恢复「{stage['title']}」为代码默认模板" + ("" if deleted else "（本就未自定义）"),
+            )
+            return redirect("reviewer:settings-prompts")
+        if action == "save":
+            content = request.POST.get("content") or ""
+            missing = [v for v in stage["required"] if "{" + v + "}" not in content]
+            if missing:
+                messages.error(
+                    request,
+                    f"「{stage['title']}」缺少必需占位符：{', '.join('{' + v + '}' for v in missing)}",
+                )
+                return redirect("reviewer:settings-prompts")
+            PromptTemplate.objects.update_or_create(name=name, defaults={"content": content})
+            messages.success(request, f"已保存「{stage['title']}」，下一次评审立即生效")
+        return redirect("reviewer:settings-prompts")
+
+    rows = {t.name: t for t in PromptTemplate.objects.all()}
+    stages = []
+    for stage in PROMPT_STAGES:
+        row = rows.get(stage["name"])
+        override = (row.content if row else "") or ""
+        stages.append(
+            {
+                **stage,
+                "custom": bool(override.strip()),
+                "updated_at": row.updated_at if row else None,
+                "effective": override.strip() or stage["default"],
+                "vars_hint": "、".join("{" + v + "}" for v in stage["variables"]),
+            }
+        )
+    return render(request, "reviewer/settings_prompts.html", {"stages": stages})
 
 
 @ui_login_required

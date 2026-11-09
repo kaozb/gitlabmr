@@ -122,6 +122,23 @@ class IssueFeedback(models.Model):
         return f"{self.project_path}:{self.relevant_file}:{self.issue_header}"
 
 
+class PromptTemplate(models.Model):
+    """Dashboard-editable prompt template for one review stage.
+
+    A missing/blank row means "use the code default" (prompts.py); the
+    恢复默认 button simply deletes the row. Placeholders are literal
+    ``{tokens}`` substituted by string replacement, so arbitrary braces in
+    edited text (YAML examples etc.) are safe.
+    """
+
+    name = models.CharField(max_length=64, unique=True)
+    content = models.TextField(blank=True, default="")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self) -> str:
+        return f"{self.name}（自定义提示词）"
+
+
 class Setting(models.Model):
     """Global service overrides edited from the dashboard.
 

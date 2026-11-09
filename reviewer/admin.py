@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import IssueFeedback, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
+from .models import IssueFeedback, PromptTemplate, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
 
 
 @admin.register(WebhookEvent)
@@ -29,6 +29,12 @@ class IssueFeedbackAdmin(admin.ModelAdmin):
     list_filter = ("project_path",)
     search_fields = ("project_path", "relevant_file", "issue_header")
     readonly_fields = [f.name for f in IssueFeedback._meta.fields]
+
+
+@admin.register(PromptTemplate)
+class PromptTemplateAdmin(admin.ModelAdmin):
+    list_display = ("name", "updated_at")
+    search_fields = ("name",)
 
 
 @admin.register(RepoTokenEntry)
