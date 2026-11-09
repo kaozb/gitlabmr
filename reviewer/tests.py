@@ -765,7 +765,7 @@ class RenderTests(TestCase):
         )
 
     def test_review_body_contains_marker_and_sections(self):
-        body = render_review(self._review(), mr_url="http://x/mr/1", remaining_files=["b.py"])
+        body = render_review(self._review(), remaining_files=["b.py"])
         self.assertIn(REVIEW_MARKER, body)
         self.assertIn("b.py", body)
 

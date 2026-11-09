@@ -393,7 +393,6 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
         ]
         body = render_review(
             _with_issues(review, summary_issues),
-            mr_url=mr.get("web_url", ""),
             remaining_files=diff_ctx.not_reviewed_files,
             filtered_files=diff_ctx.filtered_files,
             language=conf.language,

@@ -22,7 +22,6 @@ def _format_security(value: str | None) -> str:
 def render_review(
     review: ReviewOutput,
     *,
-    mr_url: str,
     remaining_files: list[str] | None = None,
     filtered_files: list[str] | None = None,
     language: str = "zh-CN",
@@ -64,7 +63,10 @@ def render_review(
     if footers:
         lines += ["---", *footers, ""]
 
-    lines += ["---", f"> 由 gitlabmr 自动生成，仅供参考，不替代人工评审。原文: {mr_url}", REVIEW_MARKER]
+    # Invisible identity marker only - the next run finds and updates this
+    # comment in place, and human-comment filtering relies on it. No visible
+    # attribution footer: comments read like a normal reviewer's opinion.
+    lines += ["---", REVIEW_MARKER]
     return "\n".join(lines)
 
 
