@@ -43,16 +43,26 @@ class ReviewRecord(models.Model):
     mr_url = models.URLField(max_length=1024, blank=True, default="")
     head_sha = models.CharField(max_length=64)
     status = models.CharField(max_length=16, choices=STATUS_CHOICES, default="running", db_index=True)
-    source = models.CharField(max_length=16, default="webhook")  # webhook|note
+    source = models.CharField(max_length=16, default="webhook")  # webhook|note|manual
     model_used = models.CharField(max_length=128, blank=True, default="")
+    # MR snapshot (professional detail page + title search on the dashboard)
+    mr_title = models.CharField(max_length=512, blank=True, default="")
+    author = models.CharField(max_length=128, blank=True, default="")
+    source_branch = models.CharField(max_length=256, blank=True, default="")
+    target_branch = models.CharField(max_length=256, blank=True, default="")
     issues_count = models.IntegerField(default=0)
     score = models.IntegerField(null=True, blank=True)
     risk_level = models.CharField(max_length=16, blank=True, default="")
     reviewed_files = models.JSONField(default=list, blank=True)
     not_reviewed_files = models.JSONField(default=list, blank=True)
+    # ALL findings of this review (inline + summary-only), same item shape as
+    # non_inline_issues - the detail page lists these with per-issue evidence.
+    key_issues = models.JSONField(default=list, blank=True)
     # key issues that were NOT published as inline comments (summary-only ones):
     # [{relevant_file, start_line, end_line, issue_header, issue_content, kind, evidence}]
     non_inline_issues = models.JSONField(default=list, blank=True)
+    # exact markdown body that was published as the MR summary comment
+    summary_comment = models.TextField(blank=True, default="")
     diff_chars = models.IntegerField(default=0)
     prompt_chars = models.IntegerField(default=0)
     completion_chars = models.IntegerField(default=0)
@@ -74,6 +84,37 @@ class ReviewRecord(models.Model):
 
     def __str__(self) -> str:
         return f"{self.project_path}!{self.mr_iid}@{self.head_sha[:8]}:{self.status}"
+
+
+class IssueFeedback(models.Model):
+    """Human false-positive mark on one review finding.
+
+    Feeds back into future prompts of the same repository so the model stops
+    re-reporting findings a human already rejected. Aggregated by project_path
+    (across MRs); the unique constraint only prevents double-marking within
+    one MR. start_line/end_line use 0 when unknown.
+    """
+
+    project_path = models.CharField(max_length=512, db_index=True)
+    mr_iid = models.IntegerField(default=0)
+    relevant_file = models.CharField(max_length=512)
+    start_line = models.IntegerField(default=0)
+    end_line = models.IntegerField(default=0)
+    issue_header = models.CharField(max_length=256, blank=True, default="")
+    marked_by = models.CharField(max_length=128, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project_path", "mr_iid", "relevant_file", "start_line", "issue_header"],
+                name="uniq_issue_feedback",
+            )
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.project_path}:{self.relevant_file}:{self.issue_header}"
 
 
 class Setting(models.Model):

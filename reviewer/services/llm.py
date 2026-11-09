@@ -293,6 +293,11 @@ def chat(cfg: LLMConfig, system: str, user: str) -> tuple[str, str]:
     return text, finish_reason
 
 
+# Absolute ceiling for the same-model retry after a truncated reply. Keeps the
+# escalation bounded even if the configured base max_output_tokens is large.
+_TRUNCATED_RETRY_CAP = 16000
+
+
 def review_with_fallback(
     cfg: LLMConfig, system: str, user: str, num_max_findings: int = 6, require_review: bool = False
 ) -> tuple[ReviewOutput | ContextRequest, str]:
@@ -300,21 +305,36 @@ def review_with_fallback(
 
     The reply may be a finished review or a ``need_context`` request (see
     ``parse_response``); a parse/transport error moves on to the next model.
+
+    A truncated reply (``finish_reason == "length"``) is retried once on the
+    SAME model with a doubled output budget before falling back: truncation is
+    an output-capacity problem, not a model-quality problem, and switching
+    models would invalidate the prompt prefix cache.
     """
     errors: list[str] = []
     for model in (cfg.model, *cfg.fallback_models):
-        attempt = LLMConfig(
-            base_url=cfg.base_url,
-            api_key=cfg.api_key,
-            model=model,
-            timeout=cfg.timeout,
-            max_output_tokens=cfg.max_output_tokens,
-            temperature=cfg.temperature,
-        )
-        try:
-            text, _ = chat(attempt, system, user)
-            return parse_response(text, num_max_findings, require_review=require_review), model
-        except LLMError as exc:
-            errors.append(f"{model}: {exc}")
-            logger.warning("review attempt failed for model %s: %s", model, exc)
+        max_tokens = cfg.max_output_tokens
+        while True:
+            attempt = LLMConfig(
+                base_url=cfg.base_url,
+                api_key=cfg.api_key,
+                model=model,
+                timeout=cfg.timeout,
+                max_output_tokens=max_tokens,
+                temperature=cfg.temperature,
+            )
+            try:
+                text, _ = chat(attempt, system, user)
+                return parse_response(text, num_max_findings, require_review=require_review), model
+            except LLMError as exc:
+                errors.append(f"{model}: {exc}")
+                logger.warning("review attempt failed for model %s: %s", model, exc)
+                escalate = (
+                    exc.reason == "truncated"
+                    and max_tokens < _TRUNCATED_RETRY_CAP
+                )
+                if escalate:
+                    max_tokens = min(max_tokens * 2, _TRUNCATED_RETRY_CAP)
+                    continue
+                break
     raise LLMError("all_models_failed", "; ".join(errors))

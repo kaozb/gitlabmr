@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from django.db import close_old_connections
 
 from ..conf import MAX_INLINE_COMMENTS, get_conf
-from ..models import ReviewRecord, try_register_review
+from ..models import IssueFeedback, ReviewRecord, try_register_review
 from .diffctx import DiffContext, build_diff_context, estimate_tokens
 from .gitlab import GitLabClient, GitLabError
 from .llm import (
@@ -186,6 +186,12 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
     if record is None:
         logger.info("review already recorded/in-flight for %s!%s@%s", project_path, mr_iid, head_sha[:8])
         return
+    # MR snapshot for the detail page / dashboard search (best-effort fields).
+    record.mr_title = (mr.get("title") or "")[:512]
+    record.author = ((mr.get("author") or {}).get("name") or "")[:128]
+    record.source_branch = (mr.get("source_branch") or "")[:256]
+    record.target_branch = (mr.get("target_branch") or "")[:256]
+    record.save(update_fields=["mr_title", "author", "source_branch", "target_branch", "updated_at"])
     tracker.persist(record)
 
     progress_note_id: int | None = None
@@ -258,6 +264,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             commit_messages=mr.get("merge_commit_message", "") or "",
             diff_ctx=diff_ctx,
             repo_context=repo_context,
+            known_false_positives=_false_positive_lines(project_path, set(diff_ctx.reviewed_files)),
         )
         record.prompt_chars = len(system) + len(user)
         tracker.persist(record)
@@ -328,6 +335,19 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
         record.issues_count = len(review.key_issues_to_review)
         record.score = review.score
         record.risk_level = review.risk_level or ""
+        # full finding list for the detail page (inline + summary-only)
+        record.key_issues = [
+            {
+                "relevant_file": i.relevant_file,
+                "start_line": i.start_line,
+                "end_line": i.end_line,
+                "issue_header": i.issue_header,
+                "issue_content": i.issue_content,
+                "kind": i.kind,
+                "evidence": i.evidence,
+            }
+            for i in review.key_issues_to_review
+        ]
         ai_detail = f"模型 {model_used}，{len(review.key_issues_to_review)} 个问题"
         if rounds_used:
             ai_detail += (
@@ -374,6 +394,8 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             filtered_files=diff_ctx.filtered_files,
             language=conf.language,
         )
+        record.summary_comment = body  # exact snapshot shown on the detail page
+        record.completion_chars = len(body)
         mode = _publish_persistent_comment(client, project_path, mr_iid, body, conf.max_comment_chars)
         publish_detail = mode if not inline_published else f"{mode}（{len(inline_published)} 条行内评论）"
         tracker.done("publish", publish_detail)
@@ -414,6 +436,30 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
 
 
 # ---------------------------------------------------------------- helpers
+
+
+FP_LOOKUP_LIMIT = 200  # recent marks scanned per review (then relevance-sorted)
+FP_PROMPT_LIMIT = 30  # lines actually injected into the prompt
+
+
+def _false_positive_lines(project_path: str, changed_files: set[str]) -> list[str]:
+    """Human-marked false positives of this repo, formatted for the prompt.
+
+    Marks on files present in this MR's diff come first (most likely to be
+    re-reported); recency breaks ties. Bounded so a heavily-marked repo can
+    neither flood the prompt nor grow it without limit.
+    """
+    recent = list(IssueFeedback.objects.filter(project_path=project_path).order_by("-created_at")[:FP_LOOKUP_LIMIT])
+    if not recent:
+        return []
+    recent.sort(key=lambda f: f.relevant_file not in changed_files)
+    lines: list[str] = []
+    for mark in recent[:FP_PROMPT_LIMIT]:
+        loc = f"`{mark.relevant_file}`"
+        if mark.start_line:
+            loc += f" L{mark.start_line}" + (f"-L{mark.end_line}" if mark.end_line > mark.start_line else "")
+        lines.append(f"{loc} {mark.issue_header}（人工已判定为误报）".strip())
+    return lines
 
 
 def _total_ms(tracker: StepTracker) -> int:

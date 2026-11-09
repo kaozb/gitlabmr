@@ -16,18 +16,18 @@ from __future__ import annotations
 import hmac
 import os
 from functools import wraps
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 from django.contrib import messages
 from django.core.paginator import EmptyPage, Paginator
 from django.core.paginator import PageNotAnInteger as _PageNotAnInteger
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
 from .conf import MAX_INLINE_COMMENTS, get_conf, normalize_match_url, reload_conf
-from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
+from .models import IssueFeedback, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
 from .services.mrref import MRRefError, parse_mr_ref
 from .services.pipeline import submit_review
 from .services.tokens import resolve_repo_token
@@ -185,8 +185,24 @@ def dashboard(request):
         ("行内评论", "开" if conf.inline_comments else "关", True),
         ("推送触发", "开" if conf.review_on_push else "关", True),
     ]
+    # 筛选：状态 / 风险 / 关键词（MR 标题、项目路径、MR 序号），全部 GET 参数可分享可收藏
+    records = ReviewRecord.objects.all()
+    status = request.GET.get("status") or ""
+    if status in {"running", "success", "failed", "skipped"}:
+        records = records.filter(status=status)
+    risk = request.GET.get("risk") or ""
+    if risk in {"low", "medium", "high"}:
+        records = records.filter(risk_level=risk)
+    q = (request.GET.get("q") or "").strip()
+    if q:
+        conditions = Q(mr_title__icontains=q) | Q(project_path__icontains=q)
+        if q.isdigit():
+            conditions |= Q(mr_iid=int(q))
+        records = records.filter(conditions)
+    kept = {"status": status, "risk": risk, "q": q}
+    url_params = urlencode({k: v for k, v in kept.items() if v})
     # 评审记录真分页：与 webhook 事件页同一套逻辑（Paginator 数据库层 LIMIT/OFFSET）
-    paginator = Paginator(ReviewRecord.objects.all(), PAGE_SIZE)
+    paginator = Paginator(records, PAGE_SIZE)
     try:
         page = paginator.page(int(request.GET.get("page", "1") or 1))
     except (ValueError, _PageNotAnInteger):
@@ -204,6 +220,8 @@ def dashboard(request):
             reviews=page.object_list,
             page_items=_page_items(paginator.num_pages, page.number),
             total=paginator.count,
+            filters=kept,
+            url_params=url_params,
         ),
     )
 
@@ -308,29 +326,65 @@ def trigger_review(request):
     return redirect("/")
 
 
+def _issue_key(issue: dict) -> tuple[str, int, str]:
+    """Identity of one finding across record fields and feedback rows."""
+    return (
+        issue.get("relevant_file", ""),
+        int(issue.get("start_line") or 0),
+        (issue.get("issue_header") or "")[:256],
+    )
+
+
+def _diff_anchor(mr_url: str, file_path: str, start_line: int) -> str:
+    """Deep link to the file/line in the GitLab diff view.
+
+    GitLab anchors replace every non-alphanumeric char of the path with "_"
+    and append ``_L<line>``; even if an anchor drifts, the link still opens
+    the correct diff page.
+    """
+    if not mr_url:
+        return ""
+    anchor = "".join(c if c.isalnum() else "_" for c in file_path)
+    line = f"_L{start_line}" if start_line else ""
+    return f"{mr_url}/diffs#{anchor}{line}"
+
+
 @ui_login_required
 def review_detail(request, pk):
     record = get_object_or_404(ReviewRecord, pk=pk)
-    # non-inline issues: file + summary lines for the detail page panel
-    non_inline_issues = [
-        {
-            "relevant_file": issue.get("relevant_file", ""),
-            "location": (
-                f"L{issue.get('start_line', '?')}-L{issue.get('end_line', '?')}"
-                if issue.get("start_line") and issue.get("end_line")
-                else ""
-            ),
-            "issue_header": issue.get("issue_header", ""),
-            "issue_content": issue.get("issue_content", ""),
-            "kind": issue.get("kind", ""),
-            "evidence": issue.get("evidence", ""),
-        }
-        for issue in (record.non_inline_issues or [])
-    ]
+    feedback_marks = {
+        _issue_key({"relevant_file": f.relevant_file, "start_line": f.start_line, "issue_header": f.issue_header}): f
+        for f in IssueFeedback.objects.filter(project_path=record.project_path, mr_iid=record.mr_iid)
+    }
+    summary_only_keys = {
+        _issue_key(issue) for issue in (record.non_inline_issues or [])
+    }
+    # Prefer the full finding list persisted by the pipeline; legacy records
+    # (created before key_issues existed) fall back to their summary-only list.
+    raw_issues = record.key_issues or record.non_inline_issues or []
+    issues = []
+    for index, issue in enumerate(raw_issues, start=1):
+        start_line = int(issue.get("start_line") or 0)
+        issues.append(
+            {
+                "index": index,
+                "relevant_file": issue.get("relevant_file", ""),
+                "start_line": start_line,
+                "end_line": int(issue.get("end_line") or start_line),
+                "location": f"L{issue.get('start_line')}-L{issue.get('end_line')}" if start_line else "",
+                "issue_header": issue.get("issue_header", ""),
+                "issue_content": issue.get("issue_content", ""),
+                "kind": issue.get("kind", ""),
+                "evidence": issue.get("evidence", ""),
+                "published": "summary" if _issue_key(issue) in summary_only_keys else "inline",
+                "diff_url": _diff_anchor(record.mr_url, issue.get("relevant_file", ""), start_line),
+                "feedback": feedback_marks.get(_issue_key(issue)),
+            }
+        )
     return render(
         request,
         "reviewer/review_detail.html",
-        _base_ctx(request, record=record, non_inline_issues=non_inline_issues),
+        _base_ctx(request, record=record, issues=issues),
     )
 
 
@@ -338,8 +392,59 @@ def review_detail(request, pk):
 @require_POST
 def retry_review(request, pk):
     record = get_object_or_404(ReviewRecord, pk=pk)
+    if record.status == "running":
+        messages.warning(request, "该 MR 正在评审中，请等待本次完成后再重新评审")
+        return redirect("reviewer:review-detail", pk=pk)
     submit_review(record.project_path, record.mr_iid, source="manual", force=True)
     messages.success(request, f"已强制重新评审：{record.project_path}!{record.mr_iid}（忽略幂等记录）")
+    return redirect("reviewer:review-detail", pk=pk)
+
+
+@ui_login_required
+@require_POST
+def mark_issue_feedback(request, pk):
+    """标记 / 撤销一条评审发现的误报，反馈进入同仓库后续评审的提示词。"""
+    record = get_object_or_404(ReviewRecord, pk=pk)
+    action = request.POST.get("action") or "mark"
+    file_path = (request.POST.get("file") or "").strip()[:512]
+    header = (request.POST.get("header") or "").strip()[:256]
+    start_line = int(request.POST["start_line"]) if (request.POST.get("start_line") or "").isdigit() else 0
+    end_line = int(request.POST["end_line"]) if (request.POST.get("end_line") or "").isdigit() else start_line
+    where = f"{record.project_path}!{record.mr_iid} {file_path}"
+    if not file_path:
+        messages.error(request, "误报标记缺少文件路径，已忽略")
+        return redirect("reviewer:review-detail", pk=pk)
+    if action == "unmark":
+        deleted, _ = IssueFeedback.objects.filter(
+            project_path=record.project_path,
+            mr_iid=record.mr_iid,
+            relevant_file=file_path,
+            start_line=start_line,
+            issue_header=header,
+        ).delete()
+        if deleted:
+            messages.success(request, f"已撤销误报标记：{where}")
+        else:
+            messages.info(request, "该发现没有误报标记，无需撤销")
+        return redirect("reviewer:review-detail", pk=pk)
+    _, created = IssueFeedback.objects.get_or_create(
+        project_path=record.project_path,
+        mr_iid=record.mr_iid,
+        relevant_file=file_path,
+        start_line=start_line,
+        issue_header=header,
+        defaults={
+            "end_line": end_line,
+            "marked_by": request.session.get("wework_userid") or "密码登录用户",
+        },
+    )
+    if created:
+        messages.success(
+            request,
+            f"已标记误报：{where}。同仓库后续评审将不再重复上报此类问题（除非出现新证据）",
+        )
+    else:
+        messages.info(request, f"该发现此前已标记过误报：{where}")
     return redirect("reviewer:review-detail", pk=pk)
 
 

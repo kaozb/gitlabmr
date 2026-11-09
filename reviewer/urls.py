@@ -21,6 +21,7 @@ urlpatterns = [
     path("work-weixin/logout", wework.wework_logout, name="wework-logout"),
     path("reviews/<int:pk>/", ui.review_detail, name="review-detail"),
     path("reviews/<int:pk>/retry/", ui.retry_review, name="review-retry"),
+    path("reviews/<int:pk>/feedback/", ui.mark_issue_feedback, name="review-feedback"),
     path("review/trigger/", ui.trigger_review, name="review-trigger"),
     # 末尾斜杠可有可无：GitLab 填不带斜杠的 URL 时避免 301 重定向把 POST 降级成 GET
     re_path(r"^tech_powered/code_review/?$", views.gitlab_webhook, name="gitlab-webhook"),

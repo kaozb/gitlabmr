@@ -4,7 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}GitLab MR AI 评审控制台{% endblock %}</title>
+  {# Inline CSS on purpose: production runs DEBUG=false with no static file server (no whitenoise/collectstatic). #}
   <style>
+    /* design tokens：灰阶 + 单一主色，语义色仅用于状态 */
     :root {
       --bg: #f4f6fb; --card: #ffffff; --line: #e4e8f0;
       --text: #1c2333; --muted: #6b7486; --accent: #2f5fe8; --accent-soft: #eaf0ff;
@@ -25,7 +27,7 @@
     nav a.active { color: #fff; font-weight: 700; border-bottom: 2px solid #7c9bff; }
     nav .spacer { flex: 1; }
     nav .tag { font-size: 12px; color: #8b94ad; }
-    main {  margin: 26px auto 60px; padding: 0 24px; }
+    main { margin: 26px auto 60px; padding: 0 24px; max-width: 1280px; }
     h1 { font-size: 20px; margin: 0 0 4px; }
     h2 { font-size: 16px; margin: 0; }
     .sub { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
@@ -35,6 +37,7 @@
     .grid { display: grid; gap: 14px; }
     .grid.cols-6 { grid-template-columns: repeat(6, 1fr); }
     .grid.cols-3 { grid-template-columns: repeat(3, 1fr); }
+    .grid.cols-2 { grid-template-columns: repeat(2, 1fr); }
     .grid .field > label:first-child { margin-top: 0; }
     .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
     .stat .num { font-size: 24px; font-weight: 700; }
@@ -109,9 +112,50 @@
     .step-arrow { align-self: center; color: var(--muted); font-size: 15px; }
     .step-detail { margin-top: 12px; }
     .step-detail.hidden { display: none; }
+
+    /* ---- dashboard: 筛选条 ---- */
+    .filterbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 14px; }
+    .filterbar .field { display: flex; flex-direction: column; }
+    .filterbar label { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--muted); }
+    .filterbar select, .filterbar input[type=text] { width: auto; min-width: 140px; }
+    .filterbar input[type=text] { min-width: 240px; }
+
+    /* ---- 评审记录行：MR 标题 ---- */
+    .mr-title { display: block; font-weight: 600; }
+    .mr-id { font-size: 12px; }
+
+    /* ---- 详情页：MR 档案头部 ---- */
+    .title-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .title-row h1 { margin: 0; }
+    .badge-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0 2px; }
+    .score-pill { font-size: 15px; font-weight: 700; }
+
+    /* ---- 详情页：问题卡 ---- */
+    ul.issue-list { list-style: none; margin: 0; padding: 0; }
+    li.issue-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px;
+      margin-bottom: 12px; background: #fff; }
+    li.issue-card.fp-marked { border-color: var(--idle); background: var(--idle-bg); }
+    .issue-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .issue-head .idx { color: var(--muted); font-weight: 700; }
+    .badge.kind-verified { background: var(--err-bg); color: var(--err); }
+    .badge.kind-suggestion { background: var(--info-bg); color: var(--info); }
+    .badge.where { background: #eef0f4; color: var(--muted); }
+    .badge.fpmarked { background: var(--idle-bg); color: var(--idle); border: 1px dashed var(--idle); }
+    .issue-loc { margin: 4px 0 6px; color: var(--muted); font-size: 12px; }
+    .issue-content { white-space: pre-wrap; word-break: break-word; font-size: 13px; }
+    .issue-evidence { margin: 8px 0 0; padding: 6px 10px; border-left: 3px solid var(--line);
+      color: var(--muted); font-size: 12px; word-break: break-word; }
+    .issue-actions { margin-top: 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .comment-snapshot { max-height: 480px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+
     @media (max-width: 1180px) { .grid.cols-3 { grid-template-columns: repeat(2, 1fr); } }
-    @media (max-width: 900px) { .grid.cols-6 { grid-template-columns: repeat(3, 1fr); } .grid.cols-3 { grid-template-columns: 1fr; } }
+    @media (max-width: 900px) {
+      .grid.cols-6 { grid-template-columns: repeat(3, 1fr); }
+      .grid.cols-3 { grid-template-columns: 1fr; }
+      .grid.cols-2 { grid-template-columns: 1fr; }
+    }
   </style>
+  {% block head %}{% endblock %}
 </head>
 <body>
 <nav>

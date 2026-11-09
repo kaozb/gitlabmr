@@ -10,7 +10,7 @@ from urllib.parse import quote
 from django.test import TestCase
 
 from .conf import MAX_FINDINGS, MAX_INLINE_COMMENTS, Conf, RepoToken, api_origin, get_conf, reload_conf
-from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent, try_register_review
+from .models import IssueFeedback, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent, try_register_review
 from .services.diffctx import (
     build_diff_context,
     build_inventory_section,
@@ -532,6 +532,21 @@ class PromptTests(TestCase):
         self.assertIn("need_context", system)
         self.assertIn("zh-CN", system)  # request reasons follow the output language
 
+    def test_user_prompt_lists_marked_false_positives_before_diff(self):
+        """误报段落在 diff 之前（缓存友好），且逐条列出人工判定结果。"""
+        ctx = build_diff_context([{"new_path": "app.py", "old_path": "app.py", "diff": SAMPLE_PATCH}], max_tokens=10000)
+        kwargs = dict(
+            title="t", description="", author="a", source_branch="f", target_branch="m", commit_messages=""
+        )
+        user = build_user_prompt(
+            **kwargs, diff_ctx=ctx,
+            known_false_positives=["`app.py` L2 Bug（人工已判定为误报）"],
+        )
+        self.assertIn("Human-marked false positives", user)
+        self.assertIn("app.py` L2 Bug（人工已判定为误报）", user)
+        self.assertLess(user.index("false positives"), user.index("## Diff"))  # stable cache prefix
+        self.assertNotIn("false positives", build_user_prompt(**kwargs, diff_ctx=ctx))
+
 
 class LLMParseTests(TestCase):
     def test_extract_yaml_block(self):
@@ -666,6 +681,40 @@ class LLMChatTests(TestCase):
         review, model = review_with_fallback(_llm_config(_conf(), fallback=("backup-model",)), "sys", "usr")
         self.assertEqual(model, "backup-model")
         self.assertEqual(review.score, 50)
+
+    @patch("reviewer.services.llm.requests.post")
+    def test_truncated_output_retries_same_model_with_bigger_budget(self, post):
+        """finish_reason=length -> same model once more with doubled max_tokens.
+
+        Switching models would throw away the cached prompt prefix, so the
+        escalation must happen on the primary model first.
+        """
+        post.side_effect = [
+            self._response("partial", finish_reason="length"),
+            self._response("review:\n  score: 60\n"),
+        ]
+        review, model = review_with_fallback(_llm_config(_conf()), "sys", "usr")
+        self.assertEqual(model, "test-model")
+        self.assertEqual(review.score, 60)
+        self.assertEqual(post.call_count, 2)
+        first, second = (call.kwargs["json"]["max_tokens"] for call in post.call_args_list)
+        self.assertEqual((first, second), (4000, 8000))
+        self.assertEqual({call.kwargs["json"]["model"] for call in post.call_args_list}, {"test-model"})
+
+    @patch("reviewer.services.llm.requests.post")
+    def test_truncated_retry_cap_then_next_model(self, post):
+        """At the cap there is no escalation: move on to the fallback model."""
+        cfg = _llm_config(_conf(), fallback=("backup-model",))
+        cfg = LLMConfig(base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
+                        fallback_models=cfg.fallback_models, max_output_tokens=16000)
+        post.side_effect = [
+            self._response("partial", finish_reason="length"),
+            self._response("review:\n  score: 40\n"),
+        ]
+        review, model = review_with_fallback(cfg, "sys", "usr")
+        self.assertEqual(model, "backup-model")
+        budgets = [call.kwargs["json"]["max_tokens"] for call in post.call_args_list]
+        self.assertEqual(budgets, [16000, 16000])  # no 32000 attempt
 
 
 class RenderTests(TestCase):
@@ -1007,6 +1056,50 @@ class PipelineTests(TestCase):
              "ai_review": "success", "publish": "success"},
         )
         self.assertTrue(all(s["detail"] for s in record.steps))  # every stage carries a log line
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_mr_meta_and_full_issues_persisted(self, client_cls, review_fn):
+        """标题/作者/分支与完整问题清单、总结评论快照都要落库（详情页档案）。"""
+        client = self._client_mock()
+        client_cls.return_value = client
+        with patch("reviewer.services.pipeline.get_conf", return_value=_conf(inline_comments=False)):
+            review_fn.return_value = (parse_review(GOOD_REVIEW_YAML, num_max_findings=6), "test-model")
+            from .services.pipeline import run_review
+
+            run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(record.mr_title, "Add feature")
+        self.assertEqual(record.author, "alice")
+        self.assertEqual((record.source_branch, record.target_branch), ("feat", "main"))
+        self.assertEqual(len(record.key_issues), 1)
+        self.assertEqual(record.key_issues[0]["issue_header"], "Bug")
+        self.assertIn(REVIEW_MARKER, record.summary_comment)
+        self.assertIn("Bug", record.summary_comment)
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_false_positive_marks_injected_into_prompt(self, client_cls, review_fn):
+        """同仓库人工标记的误报进入提示词；命中 diff 文件的排在前面。"""
+        IssueFeedback.objects.create(project_path="backend/payments", mr_iid=9,
+                                     relevant_file="other.py", start_line=1,
+                                     issue_header="Old finding", marked_by="zhang")
+        IssueFeedback.objects.create(project_path="backend/payments", mr_iid=9,
+                                     relevant_file="app.py", start_line=2,
+                                     issue_header="Bug", marked_by="zhang")
+        client = self._client_mock()
+        client_cls.return_value = client
+        review_fn.return_value = (parse_review(GOOD_REVIEW_YAML, num_max_findings=6), "test-model")
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        user_prompt = review_fn.call_args.args[2]
+        self.assertIn("Human-marked false positives", user_prompt)
+        self.assertIn("`app.py` L2 Bug", user_prompt)
+        self.assertIn("`other.py` L1 Old finding", user_prompt)
+        self.assertLess(user_prompt.index("app.py` L2 Bug"), user_prompt.index("other.py` L1"))
 
     @patch("reviewer.services.pipeline.review_with_fallback")
     @patch("reviewer.services.pipeline.GitLabClient")
@@ -1642,19 +1735,94 @@ class DashboardTests(TestCase):
         submit.assert_called_once_with("backend/payments", 7, source="manual", force=True)
 
     def test_detail_shows_non_inline_issues(self):
-        """The detail page lists the review issues that did not go inline."""
+        """Legacy records (no key_issues) still list their summary-only issues."""
         record = self._record(non_inline_issues=[{
             "relevant_file": "app.py", "start_line": 2, "end_line": 2,
             "issue_header": "Bug", "issue_content": "bad thing", "kind": "verified",
             "evidence": "app.py:2 uses x",
         }])
         resp = self.client.get(f"/reviews/{record.pk}/")
-        self.assertContains(resp, "非行内评审意见")
+        self.assertContains(resp, "评审发现")
         self.assertContains(resp, "Bug")
         self.assertContains(resp, "bad thing")
         self.assertContains(resp, "app.py L2-L2")
         self.assertContains(resp, "verified")
         self.assertContains(resp, "app.py:2 uses x")
+        self.assertContains(resp, "总结评论")
+        # deep link into the GitLab diff view at the finding's line
+        self.assertContains(resp, f"{record.mr_url}/diffs#app_py_L2")
+        self.assertContains(resp, "标记误报")
+
+    def test_detail_shows_all_issues_with_publish_channel(self):
+        """key_issues lists every finding; summary-only ones are distinguishable."""
+        issues = [
+            {"relevant_file": "app.py", "start_line": 2, "end_line": 2, "issue_header": "Bug",
+             "issue_content": "bad thing", "kind": "verified", "evidence": "app.py:2 uses x"},
+            {"relevant_file": "src/util.py", "start_line": 7, "end_line": 9, "issue_header": "Style",
+             "issue_content": "cleanup", "kind": "suggestion", "evidence": "patch-only"},
+        ]
+        record = self._record(key_issues=issues, non_inline_issues=[issues[1]])
+        resp = self.client.get(f"/reviews/{record.pk}/")
+        self.assertContains(resp, "Bug")
+        self.assertContains(resp, "Style")
+        self.assertContains(resp, "行内评论")
+        self.assertContains(resp, "总结评论")
+        self.assertContains(resp, f"{record.mr_url}/diffs#src_util_py_L7")
+
+    def test_feedback_mark_unmark_roundtrip(self):
+        """误报标记：mark 落库去重，unmark 删除，重复 mark 只留一条。"""
+        record = self._record(key_issues=[{
+            "relevant_file": "app.py", "start_line": 2, "end_line": 2, "issue_header": "Bug",
+            "issue_content": "bad thing", "kind": "verified", "evidence": "",
+        }])
+        url = f"/reviews/{record.pk}/feedback/"
+        payload = {"action": "mark", "file": "app.py", "start_line": "2", "end_line": "2", "header": "Bug"}
+        resp = self.client.post(url, payload)
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+        mark = IssueFeedback.objects.get()
+        self.assertEqual((mark.project_path, mark.mr_iid, mark.relevant_file, mark.start_line), 
+                         ("backend/payments", 7, "app.py", 2))
+        self.assertEqual(mark.marked_by, "tester")
+        self.client.post(url, payload)  # duplicate mark must not create a second row
+        self.assertEqual(IssueFeedback.objects.count(), 1)
+        # detail page shows the marked state and the unmark button
+        page = self.client.get(f"/reviews/{record.pk}/")
+        self.assertContains(page, "已标记误报")
+        self.assertContains(page, "撤销误报标记")
+        # unmark removes it
+        resp = self.client.post(url, {"action": "unmark", "file": "app.py", "start_line": "2",
+                                      "end_line": "2", "header": "Bug"})
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+        self.assertEqual(IssueFeedback.objects.count(), 0)
+
+    def test_feedback_requires_file(self):
+        record = self._record()
+        self.client.post(f"/reviews/{record.pk}/feedback/", {"action": "mark", "file": " "})
+        self.assertEqual(IssueFeedback.objects.count(), 0)
+
+    def test_retry_blocked_while_running(self):
+        record = self._record(status="running")
+        with patch("reviewer.ui.submit_review") as submit:
+            resp = self.client.post(f"/reviews/{record.pk}/retry/")
+        submit.assert_not_called()
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+
+    # ---- 首页筛选：状态 / 风险 / 关键词 ----
+
+    def test_dashboard_filters_status_risk_and_search(self):
+        self._record(project_path="backend/payments", mr_iid=1, head_sha="a" * 40,
+                     mr_title="支付回调重构", risk_level="high", status="success")
+        self._record(project_path="frontend/web", mr_iid=2, head_sha="b" * 40,
+                     mr_title="首页样式调整", risk_level="low", status="failed")
+        self.assertEqual(len(self.client.get("/?status=failed").context["reviews"]), 1)
+        self.assertEqual(len(self.client.get("/?risk=high").context["reviews"]), 1)
+        self.assertEqual(len(self.client.get("/?q=支付").context["reviews"]), 1)
+        self.assertEqual(self.client.get("/?q=支付").context["reviews"][0].project_path, "backend/payments")
+        self.assertEqual(len(self.client.get("/?q=frontend").context["reviews"]), 1)
+        self.assertEqual(len(self.client.get("/?q=9999").context["reviews"]), 0)
+        # filters survive pagination links
+        page = self.client.get("/?status=failed&q=x")
+        self.assertEqual(page.context["url_params"], "status=failed&q=x")
 
     def test_detail_shows_skip_reason(self):
         record = self._record(status="skipped", error_detail="no reviewable files")

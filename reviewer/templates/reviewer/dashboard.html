@@ -1,14 +1,14 @@
 {% extends "reviewer/base.html" %}
+{% block head %}{% if stats.running %}<meta http-equiv="refresh" content="5">{% endif %}{% endblock %}
 {% block content %}
 <h1>评审总览</h1>
-<p class="sub">MR 评审的实时状态、历史记录与手动触发入口。</p>
+<p class="sub">MR 评审的实时状态、历史记录与手动触发入口。{% if stats.running %}有评审进行中，本页每 5 秒自动刷新。{% endif %}</p>
 
 <div class="grid cols-6">
   <div class="stat"><div class="num">{{ stats.total }}</div><div class="label">累计评审</div></div>
   <div class="stat ok"><div class="num">{{ stats.success }}</div><div class="label">成功</div></div>
   <div class="stat err"><div class="num">{{ stats.failed }}</div><div class="label">失败</div></div>
   <div class="stat info"><div class="num">{{ stats.running }}</div><div class="label">进行中</div></div>
-  <div class="stat idle"><div class="num">{{ stats.skipped }}</div><div class="label">跳过</div></div>
   <div class="stat idle"><div class="num">{{ stats.skipped }}</div><div class="label">跳过</div></div>
   <a class="stat" href="{% url 'reviewer:webhook-events' %}"><div class="num">{{ stats.events }}</div><div class="label">Webhook 事件 ›</div></a>
 </div>
@@ -32,6 +32,37 @@
     <h2>评审记录</h2>
     <span class="muted">共 {{ total }} 条 · 第 {{ page_obj.number }} / {{ page_obj.paginator.num_pages }} 页 · 每页 50 条</span>
   </div>
+
+  <form class="filterbar" method="get" action="/">
+    <div class="field">
+      <label for="f-status">状态</label>
+      <select id="f-status" name="status">
+        <option value="">全部</option>
+        <option value="running" {% if filters.status == "running" %}selected{% endif %}>进行中</option>
+        <option value="success" {% if filters.status == "success" %}selected{% endif %}>成功</option>
+        <option value="failed" {% if filters.status == "failed" %}selected{% endif %}>失败</option>
+        <option value="skipped" {% if filters.status == "skipped" %}selected{% endif %}>跳过</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="f-risk">风险</label>
+      <select id="f-risk" name="risk">
+        <option value="">全部</option>
+        <option value="high" {% if filters.risk == "high" %}selected{% endif %}>high</option>
+        <option value="medium" {% if filters.risk == "medium" %}selected{% endif %}>medium</option>
+        <option value="low" {% if filters.risk == "low" %}selected{% endif %}>low</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="f-q">关键词</label>
+      <input id="f-q" type="text" name="q" value="{{ filters.q }}" placeholder="MR 标题 / 项目路径 / MR 序号">
+    </div>
+    <button class="btn" type="submit">筛选</button>
+    {% if filters.status or filters.risk or filters.q %}
+    <a class="btn small" href="/">清除筛选</a>
+    {% endif %}
+  </form>
+
   {% if reviews %}
   <table>
     <thead>
@@ -43,9 +74,13 @@
       <tr>
         <td class="muted mono">{{ r.created_at|date:"m-d H:i" }}</td>
         <td>
-          {% if r.mr_url %}<a href="{{ r.mr_url }}" target="_blank">{{ r.project_path }}!{{ r.mr_iid }}</a>
-          {% else %}{{ r.project_path }}!{{ r.mr_iid }}{% endif %}
-          <span class="muted mono" style="margin-left:6px">{{ r.head_sha|slice:":8" }}</span>
+          <span class="mr-title">{{ r.mr_title|default:"（无标题）" }}</span>
+          <span class="mr-id">
+            {% if r.mr_url %}<a href="{{ r.mr_url }}" target="_blank">{{ r.project_path }}!{{ r.mr_iid }}</a>
+            {% else %}{{ r.project_path }}!{{ r.mr_iid }}{% endif %}
+            <span class="muted mono">{{ r.head_sha|slice:":8" }}</span>
+            {% if r.author %}<span class="muted">· {{ r.author }}</span>{% endif %}
+          </span>
         </td>
         <td><span class="badge {{ r.status }}" {% if r.error_detail %}title="{{ r.error_detail }}"{% endif %}>{{ r.status }}</span></td>
         <td>{% if r.score %}{{ r.score }}{% else %}—{% endif %}</td>
@@ -53,23 +88,25 @@
         <td class="muted">{% if r.duration_ms %}{{ r.duration_ms|floatformat:1 }}s{% else %}—{% endif %}</td>
         <td>
           <a class="btn small" href="{% url 'reviewer:review-detail' r.pk %}">详情</a>
+          {% if r.status != "running" %}
           <form class="inline" method="post" action="{% url 'reviewer:review-retry' r.pk %}"
                 onsubmit="return confirm('强制重新评审 {{ r.project_path }}!{{ r.mr_iid }} ？')">
             {% csrf_token %}<button class="btn small" type="submit">重新评审</button>
           </form>
+          {% endif %}
         </td>
       </tr>
       {% endfor %}
     </tbody>
   </table>
   {% else %}
-  <div class="empty">暂无评审记录 —— 配置好仓库令牌后，MR 打开/推送或评论 /review 时会自动出现在这里。</div>
+  <div class="empty">没有匹配的评审记录{% if filters.status or filters.risk or filters.q %}（调整或清除上方筛选条件）{% else %} —— 配置好仓库令牌后，MR 打开/推送或评论 /review 时会自动出现在这里{% endif %}。</div>
   {% endif %}
 
   {% if page_obj.has_other_pages %}
   <div class="pager">
     {% if page_obj.has_previous %}
-    <a class="btn small" href="?page={{ page_obj.previous_page_number }}">‹ 上一页</a>
+    <a class="btn small" href="?{{ url_params|default:'' }}{% if url_params %}&{% endif %}page={{ page_obj.previous_page_number }}">‹ 上一页</a>
     {% else %}<span class="btn small" style="visibility:hidden">‹ 上一页</span>{% endif %}
 
     {% for kind, num in page_items %}
@@ -78,12 +115,12 @@
     {% elif num == page_obj.number %}
     <span class="btn small current">{{ num }}</span>
     {% else %}
-    <a class="btn small" href="?page={{ num }}">{{ num }}</a>
+    <a class="btn small" href="?{{ url_params|default:'' }}{% if url_params %}&{% endif %}page={{ num }}">{{ num }}</a>
     {% endif %}
     {% endfor %}
 
     {% if page_obj.has_next %}
-    <a class="btn small" href="?page={{ page_obj.next_page_number }}">下一页 ›</a>
+    <a class="btn small" href="?{{ url_params|default:'' }}{% if url_params %}&{% endif %}page={{ page_obj.next_page_number }}">下一页 ›</a>
     {% else %}<span class="btn small" style="visibility:hidden">下一页 ›</span>{% endif %}
   </div>
   {% endif %}

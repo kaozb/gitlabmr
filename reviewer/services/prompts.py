@@ -131,6 +131,7 @@ def build_user_prompt(
     commit_messages: str,
     diff_ctx: DiffContext,
     repo_context: str = "",
+    known_false_positives: list[str] | None = None,
 ) -> str:
     inventory = build_inventory_section(diff_ctx)
     parts = [
@@ -143,6 +144,16 @@ def build_user_prompt(
         parts.append(f"Description:\n{description[:4000]}")
     if commit_messages:
         parts.append(f"Commit messages:\n{commit_messages[:2000]}")
+    if known_false_positives:
+        # Kept inside the stable prefix (before the diff): it changes rarely and
+        # must not bust the prompt cache on every round.
+        parts.append(
+            "\n## Human-marked false positives (do NOT report these again)\n"
+            "Repository maintainers marked the following earlier findings as false "
+            "positives. Do not report them again unless you have NEW concrete "
+            "evidence that the problem really exists:\n"
+            + "\n".join(f"- {line}" for line in known_false_positives)
+        )
     parts.append("\n## Diff (new-file line numbers on the left)\n")
     parts.append(diff_ctx.diff_text)
     if repo_context:
