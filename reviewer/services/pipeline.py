@@ -27,7 +27,11 @@ from .llm import (
     filter_unverified_absence_issues,
     review_with_fallback,
 )
-from .prompts import build_system_prompt, build_user_prompt
+from .prompts import (
+    build_system_prompt,
+    build_user_prompt,
+    context_exhausted_note,
+)
 from .repoctx import build_repo_context, fetch_requested_context
 from .render import (
     REVIEW_MARKER,
@@ -52,15 +56,8 @@ STEP_LABELS = {
     "publish": "回写评论",
 }
 
-# Appended once the need_context fetch budget is spent; the next reply is
-# parsed with require_review=True so a refusal to review falls into the
-# normal model-fallback chain instead of looping forever.
-CONTEXT_EXHAUSTED_NOTE = (
-    "\n\n## Note\nThe context request budget is exhausted - no further repository "
-    "content can be fetched. You MUST now answer with the final review YAML schema "
-    "based on the information you already have. Do NOT answer with need_context."
-)
-
+# (CONTEXT_EXHAUSTED_NOTE default text lives in prompts.py; a dashboard
+# override is resolved once per run via context_exhausted_note().)
 
 def get_executor() -> ThreadPoolExecutor:
     global _EXECUTOR
@@ -257,6 +254,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
         # -- stage 4: AI review (with optional model-driven context fetch rounds)
         tracker.start("ai_review")
         fetch_rounds = conf.context_fetch_rounds
+        exhausted_note = context_exhausted_note()
         system = build_system_prompt(
             conf.num_max_findings, conf.language, allow_context_requests=fetch_rounds > 0
         )
@@ -296,7 +294,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
                 break
             # The model asked for more repository context via need_context.
             if rounds_used >= fetch_rounds:
-                user += CONTEXT_EXHAUSTED_NOTE
+                user += exhausted_note
                 review, model_used = review_with_fallback(
                     llm_cfg, system, user, conf.num_max_findings, require_review=True
                 )
@@ -319,7 +317,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             )
             if not sections:
                 # Nothing could be fetched - force the final review now.
-                user += CONTEXT_EXHAUSTED_NOTE
+                user += exhausted_note
                 review, model_used = review_with_fallback(
                     llm_cfg, system, user, conf.num_max_findings, require_review=True
                 )

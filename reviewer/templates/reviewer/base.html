@@ -76,7 +76,11 @@
     input[type=text], input[type=password], input[type=number], select {
       width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
       font-size: 13px; background: #fff; color: var(--text); }
-    input:focus, select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px;
+      font: 12px/1.6 ui-monospace, Menlo, Consolas, monospace; background: #fff; color: var(--text);
+      resize: vertical; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft); }
     .hint { color: var(--muted); font-size: 12px; margin-top: 3px; }
     .fieldset-title { font-weight: 700; margin: 22px 0 2px; padding-bottom: 6px; border-bottom: 1px dashed var(--line); }
     .fieldset-title:first-child { margin-top: 0; }
@@ -163,6 +167,7 @@
   <a href="{% url 'reviewer:dashboard' %}" {% if request.resolver_match.url_name == 'dashboard' %}class="active"{% endif %}>评审总览</a>
   <a href="{% url 'reviewer:webhook-events' %}" {% if request.resolver_match.url_name == 'webhook-events' %}class="active"{% endif %}>Webhook 事件</a>
   <a href="{% url 'reviewer:settings-llm' %}" {% if request.resolver_match.url_name == 'settings-llm' %}class="active"{% endif %}>LLM 设置</a>
+  <a href="{% url 'reviewer:settings-prompts' %}" {% if request.resolver_match.url_name == 'settings-prompts' %}class="active"{% endif %}>提示词</a>
   <a href="{% url 'reviewer:settings-repos' %}" {% if request.resolver_match.url_name == 'settings-repos' %}class="active"{% endif %}>仓库令牌</a>
   <span class="spacer"></span>
   {% if ui_authed %}

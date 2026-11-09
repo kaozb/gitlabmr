@@ -1,0 +1,45 @@
+{% extends "reviewer/base.html" %}
+{% block title %}提示词管理 · GitLab MR AI 评审控制台{% endblock %}
+{% block content %}
+<h1>提示词管理</h1>
+<p class="hint" style="margin-bottom:6px">
+  各评审阶段的提示词模板。代码内置默认模板用于初始化和恢复；此处保存的自定义内容优先生效，
+  留空保存或点「恢复默认」即回到代码默认。占位符在保存时校验，渲染时按变量名原样替换。
+</p>
+
+{% for s in stages %}
+<div class="card" style="margin-top:16px">
+  <div class="card-head" style="display:flex;align-items:center;gap:10px">
+    <h2 style="margin:0">{{ s.title }}</h2>
+    {% if s.custom %}
+      <span class="badge kind-verified">已自定义{% if s.updated_at %} · {{ s.updated_at|date:"Y-m-d H:i" }}{% endif %}</span>
+    {% else %}
+      <span class="badge where">代码默认</span>
+    {% endif %}
+  </div>
+  <p class="hint">{{ s.description }}</p>
+  {% if s.vars_hint %}<p class="hint">可用占位符：<span class="mono">{{ s.vars_hint }}</span></p>{% endif %}
+  <form method="post" style="margin-top:10px">
+    {% csrf_token %}
+    <input type="hidden" name="name" value="{{ s.name }}">
+    <input type="hidden" name="action" value="save">
+    <textarea name="content" rows="{{ s.rows|default:14 }}" spellcheck="false">{{ s.effective }}</textarea>
+    <div style="display:flex;align-items:center;gap:10px;margin-top:8px">
+      <button class="btn primary small" type="submit">保存（下一次评审立即生效）</button>
+      <span class="hint">
+        {% if s.custom %}当前生效：后台自定义版本{% else %}当前生效：代码默认模板{% endif %}
+      </span>
+    </div>
+  </form>
+  {% if s.custom %}
+  <form method="post" style="margin-top:8px"
+        onsubmit="return confirm('恢复为代码默认模板？当前自定义内容将被删除。')">
+    {% csrf_token %}
+    <input type="hidden" name="name" value="{{ s.name }}">
+    <input type="hidden" name="action" value="restore">
+    <button class="btn small" type="submit">恢复默认</button>
+  </form>
+  {% endif %}
+</div>
+{% endfor %}
+{% endblock %}
