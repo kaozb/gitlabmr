@@ -241,6 +241,11 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
                     detail += f"，{len(ctx_stats['symbols'])} 个符号的引用搜索"
                 if not ctx_stats["search_available"]:
                     detail += "（实例未启用高级搜索，跳过引用搜索）"
+        human_comments: list[str] = []
+        if conf.human_comments_in_prompt:
+            human_comments = _human_comment_lines(client, project_path, mr_iid)
+            if human_comments:
+                detail += f"；人类评审意见 {len(human_comments)} 条"
         tracker.done("fetch_diff", detail)
         record.reviewed_files = diff_ctx.reviewed_files
         record.not_reviewed_files = diff_ctx.not_reviewed_files
@@ -265,6 +270,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             diff_ctx=diff_ctx,
             repo_context=repo_context,
             known_false_positives=_false_positive_lines(project_path, set(diff_ctx.reviewed_files)),
+            human_comments=human_comments,
         )
         record.prompt_chars = len(system) + len(user)
         tracker.persist(record)
@@ -440,6 +446,43 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
 
 FP_LOOKUP_LIMIT = 200  # recent marks scanned per review (then relevance-sorted)
 FP_PROMPT_LIMIT = 30  # lines actually injected into the prompt
+
+HC_MAX_NOTES = 20  # human comments injected at most
+HC_NOTE_CHARS = 600  # per-comment body cap (whitespace-squashed)
+HC_TOTAL_CHARS = 6000  # whole human-comments section budget
+
+
+def _human_comment_lines(client: GitLabClient, project_path: str, mr_iid: int) -> list[str]:
+    """Human reviewer comments on this MR, formatted for the prompt.
+
+    Filters out system notes (state changes, approvals), our own bot notes and
+    anything carrying our ``gitlabmr:`` markers. Most recent first (the notes
+    API returns desc); bounded so a chatty MR cannot flood the prompt.
+    Best-effort: any GitLab error degrades to "no comments".
+    """
+    try:
+        notes = client.list_notes(project_path, mr_iid)
+    except GitLabError as exc:
+        logger.warning("could not read human comments on %s!%s: %s", project_path, mr_iid, exc)
+        return []
+    own_id = client.get_own_user_id()
+    lines: list[str] = []
+    used = 0
+    for note in notes:
+        if len(lines) >= HC_MAX_NOTES or used >= HC_TOTAL_CHARS:
+            break
+        if note.get("system"):
+            continue
+        author = note.get("author") or {}
+        if own_id is not None and author.get("id") == own_id:
+            continue
+        body = " ".join(str(note.get("body") or "").split())
+        if not body or "gitlabmr:" in body:
+            continue
+        line = f"{author.get('name', 'someone')}: {body[:HC_NOTE_CHARS]}"
+        lines.append(line)
+        used += len(line) + 1
+    return lines
 
 
 def _false_positive_lines(project_path: str, changed_files: set[str]) -> list[str]:

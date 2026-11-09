@@ -154,6 +154,7 @@ class Setting(models.Model):
     workers = models.IntegerField(null=True, blank=True)
     gitlab_timeout = models.IntegerField(null=True, blank=True)
     context_fetch_rounds = models.IntegerField(null=True, blank=True)
+    human_comments_in_prompt = models.BooleanField(null=True, blank=True)
 
     updated_at = models.DateTimeField(auto_now=True)
 
