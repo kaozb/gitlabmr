@@ -92,9 +92,33 @@ Judging rules:
 {schema}"""
 
 
-def build_system_prompt(num_max_findings: int, language: str) -> str:
+CONTEXT_PROTOCOL_TEMPLATE = """Context request protocol (active for this review):
+- If, and only if, you genuinely cannot produce reliable findings without
+  seeing more of the repository, answer with a single YAML object that has
+  exactly one key `need_context`: a list of at most 6 items, each either
+    - type: file
+      path: <repo-relative path of the file you need, as stored in the repo>
+      reason: <one short sentence, in {language}, saying what you need to verify>
+    - type: search
+      symbol: <identifier to look up across the repository>
+      reason: <one short sentence, in {language}>
+- Ask only for content you actually need to confirm or refute a finding;
+  never re-request the diff, MR metadata, or files already shown above.
+- Use it sparingly: every request costs an extra round. If the visible
+  information is sufficient, or the concern is only about the changed lines
+  themselves, answer with the review schema directly.
+- A context request must never be mixed with a review. The next message you
+  receive will contain the requested content; then you must answer with the
+  review schema.
+"""
+
+
+def build_system_prompt(num_max_findings: int, language: str, allow_context_requests: bool = False) -> str:
     schema = SCHEMA_TEMPLATE.format(num_max_findings=num_max_findings)
-    return SYSTEM_TEMPLATE.format(language=language, schema=schema)
+    prompt = SYSTEM_TEMPLATE.format(language=language, schema=schema)
+    if allow_context_requests:
+        prompt += "\n" + CONTEXT_PROTOCOL_TEMPLATE.format(language=language)
+    return prompt
 
 
 def build_user_prompt(

@@ -43,6 +43,31 @@ DEF_RE = re.compile(
 
 MIN_SYMBOL_LEN = 4
 
+# Agentic fetch: model-issued need_context requests are honored with hard
+# caps so a runaway loop can never flood the prompt (or GitLab) with calls.
+MAX_REQUESTED_ITEMS = 6          # items consumed per round (also a prompt rule)
+MAX_REQUESTED_FILES = 4          # whole-file fetches per round
+MAX_REQUESTED_TOTAL_CHARS = 40000  # accumulated extra context per review
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def sanitize_repo_path(path: str) -> str:
+    """Normalize a model-supplied path to a safe repo-relative one ("" = refuse).
+
+    Guards against absolute paths, traversal, and drive/backslash tricks;
+    the value is only ever passed to the GitLab file API, but refusing early
+    keeps junk out of both the API call and the prompt.
+    """
+    value = str(path or "").strip().lstrip("/")
+    if not value or "\\" in value or ".." in value.split("/"):
+        return ""
+    return value
+
+
+def _is_identifier(symbol: str) -> bool:
+    return bool(_IDENTIFIER_RE.match(symbol)) and len(symbol) >= 3
+
 
 def extract_symbols(diff_ctx: DiffContext, limit: int) -> list[str]:
     """Identifiers worth a repo-wide usage lookup, taken from added lines only.
@@ -86,6 +111,45 @@ def _render_numbered(content: str, max_chars: int) -> str:
     return body
 
 
+def search_symbol_block(
+    client: GitLabClient,
+    project: str,
+    ref: str,
+    symbol: str,
+    *,
+    exclude_paths: set[str],
+    max_hits: int = 5,
+) -> tuple[str, str]:
+    """Repo-wide usage evidence for one symbol as a markdown block.
+
+    Returns ``(block, status)`` where status is ``"ok"`` (block may still be
+    empty when nothing relevant was found), ``"unavailable"`` (the instance
+    rejected the query because advanced search is not enabled - callers stop
+    instead of hammering the endpoint) or ``"error"`` (transient API failure).
+    """
+    try:
+        results = client.search_blobs(project, symbol, ref)
+    except GitLabError as exc:
+        logger.warning("blob search failed for %r on %s: %s", symbol, project, exc)
+        return "", "error"
+    if not isinstance(results, list):
+        return "", "unavailable"
+    hits: list[str] = []
+    for item in results:
+        path = item.get("path") or ""
+        if not path or path in exclude_paths:
+            continue  # usage inside the diff the model already sees
+        snippet = (item.get("data") or "").strip().splitlines()
+        first = snippet[0].strip()[:160] if snippet else ""
+        line = item.get("startline")
+        hits.append(f"- `{path}:{line}`: {first}" if line else f"- `{path}`: {first}")
+        if len(hits) >= max_hits:
+            break
+    if not hits:
+        return "", "ok"
+    return f"#### `{symbol}`\n" + "\n".join(hits), "ok"
+
+
 def _search_references(
     client: GitLabClient,
     project: str,
@@ -94,36 +158,18 @@ def _search_references(
     *,
     exclude_paths: set[str],
 ) -> tuple[list[str], bool, list[str]]:
-    """Blob-search each symbol; returns (blocks, search_available, searched).
-
-    ``search_available=False`` means the instance rejected the query because
-    advanced search is not enabled - remaining symbols are then skipped
-    instead of hammering an endpoint that cannot answer.
-    """
+    """Blob-search each symbol; returns (blocks, search_available, searched)."""
     blocks: list[str] = []
     searched: list[str] = []
     for symbol in symbols:
-        try:
-            results = client.search_blobs(project, symbol, ref)
-        except GitLabError as exc:
-            logger.warning("blob search failed for %r on %s: %s", symbol, project, exc)
+        block, status = search_symbol_block(client, project, ref, symbol, exclude_paths=exclude_paths)
+        if status == "unavailable":
+            return blocks, False, searched
+        if status == "error":
             continue
-        if not isinstance(results, list):
-            return blocks, False, searched  # advanced search unavailable
         searched.append(symbol)
-        hits: list[str] = []
-        for item in results:
-            path = item.get("path") or ""
-            if not path or path in exclude_paths:
-                continue  # usage inside the diff the model already sees
-            snippet = (item.get("data") or "").strip().splitlines()
-            first = snippet[0].strip()[:160] if snippet else ""
-            line = item.get("startline")
-            hits.append(f"- `{path}:{line}`: {first}" if line else f"- `{path}`: {first}")
-            if len(hits) >= 5:
-                break
-        if hits:
-            blocks.append(f"#### `{symbol}`\n" + "\n".join(hits))
+        if block:
+            blocks.append(block)
         if sum(len(b) for b in blocks) > SEARCH_REF_BLOCK_CHARS:
             break
     return blocks, True, searched
@@ -186,3 +232,67 @@ def build_repo_context(
         return "", stats
     header = f"## Repository context (fetched via GitLab API at ref `{ref[:12]}`)\n"
     return header + "\n\n".join(sections), stats
+
+
+def fetch_requested_context(
+    client: GitLabClient,
+    project: str,
+    ref: str,
+    request,  # llm.ContextRequest (duck-typed: .items with type/path/symbol/reason)
+    *,
+    max_file_chars: int,
+    exclude_paths: set[str],
+    total_budget: int = MAX_REQUESTED_TOTAL_CHARS,
+) -> tuple[list[str], dict]:
+    """Honor a model-issued ``need_context`` request over the GitLab API.
+
+    Hard caps keep a runaway model bounded: at most ``MAX_REQUESTED_ITEMS``
+    entries and ``MAX_REQUESTED_FILES`` whole files per round, all extra
+    sections together clamped to ``total_budget`` characters. Invalid paths /
+    symbols and API failures are skipped (best-effort, like the layer-1
+    enrichment); ``stats`` reports what was actually added so the caller can
+    log it on the review record.
+    """
+    stats: dict = {"files": [], "symbols": [], "skipped": 0}
+    sections: list[str] = []
+    used = 0
+    files_seen = 0
+    for item in request.items[:MAX_REQUESTED_ITEMS]:
+        suffix = f"\n> 请求理由：{item.reason}" if item.reason else ""
+        if item.type == "file":
+            if files_seen >= MAX_REQUESTED_FILES:
+                stats["skipped"] += 1
+                continue
+            path = sanitize_repo_path(item.path)
+            if not path or path in exclude_paths or used >= total_budget:
+                stats["skipped"] += 1
+                continue
+            files_seen += 1
+            try:
+                content = client.get_file_content(project, path, ref)
+            except GitLabError as exc:
+                logger.warning("requested file unavailable %s@%s: %s", path, ref[:8], exc)
+                stats["skipped"] += 1
+                continue
+            if not isinstance(content, str) or not content.strip():
+                stats["skipped"] += 1
+                continue
+            body = _render_numbered(content, max_file_chars)
+            section = f"### Requested file: `{path}`\n\n```\n{body}\n```{suffix}"
+            used += len(section)
+            sections.append(section)
+            stats["files"].append(path)
+        else:  # search
+            symbol = (item.symbol or "").strip()
+            if not _is_identifier(symbol) or used >= total_budget:
+                stats["skipped"] += 1
+                continue
+            block, status = search_symbol_block(client, project, ref, symbol, exclude_paths=exclude_paths)
+            if status != "ok" or not block:
+                stats["skipped"] += 1
+                continue
+            section = f"{block}{suffix}"
+            used += len(section)
+            sections.append(section)
+            stats["symbols"].append(symbol)
+    return sections, stats

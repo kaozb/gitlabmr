@@ -107,6 +107,7 @@ class Setting(models.Model):
     language = models.CharField(max_length=16, blank=True, default="")
     workers = models.IntegerField(null=True, blank=True)
     gitlab_timeout = models.IntegerField(null=True, blank=True)
+    context_fetch_rounds = models.IntegerField(null=True, blank=True)
 
     updated_at = models.DateTimeField(auto_now=True)
 

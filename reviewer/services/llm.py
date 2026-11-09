@@ -107,6 +107,34 @@ class ReviewOutput(BaseModel):
 
 
 _FENCE_RE = re.compile(r"```(?:ya?ml)?\s*\n(.*?)```", re.DOTALL)
+
+
+class ContextRequestItem(BaseModel):
+    """One entry of a model-issued ``need_context`` request."""
+
+    type: str = Field(default="file")  # file | search
+    path: str = ""
+    symbol: str = ""
+    reason: str = ""
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _norm_type(cls, value):
+        lowered = str(value or "").strip().lower()
+        return lowered if lowered in ("file", "search") else "file"
+
+    @field_validator("path", "symbol", "reason", mode="before")
+    @classmethod
+    def _clean(cls, value):
+        return str(value or "").strip()[:300] if value is not None else ""
+
+
+class ContextRequest(BaseModel):
+    """The model asked for more repository content instead of reviewing."""
+
+    items: list[ContextRequestItem] = Field(default_factory=list)
+
+
 _BROKEN_VALUE_RE = re.compile(r"^(\s*-?\s*[\w.\[\]]+):(?!\S)(\s*)(.*:.*\S)?\s*$")
 
 # Absence claims about repository-wide state ("X is unused", "no caller was
@@ -166,6 +194,17 @@ def _repair_lines(raw: str) -> str:
 
 
 def parse_review(text: str, num_max_findings: int = 6) -> ReviewOutput:
+    data = _load_yaml_object(text)
+    review = data.get("review", data)  # accept both nested and flat forms
+    if not isinstance(review, dict):
+        raise LLMError("bad_yaml", "missing 'review' mapping")
+    try:
+        return ReviewOutput.model_validate(review, context={"num_max_findings": num_max_findings})
+    except ValidationError as exc:
+        raise LLMError("bad_schema", exc.errors()[0].get("msg", "validation failed")) from exc
+
+
+def _load_yaml_object(text: str) -> dict:
     raw = extract_yaml_block(text)
     data = None
     for attempt in (raw, _repair_lines(raw)):
@@ -176,6 +215,30 @@ def parse_review(text: str, num_max_findings: int = 6) -> ReviewOutput:
             continue
     if not isinstance(data, dict):
         raise LLMError("bad_yaml", "response is not a YAML mapping")
+    return data
+
+
+def parse_response(
+    text: str, num_max_findings: int = 6, require_review: bool = False
+) -> ReviewOutput | ContextRequest:
+    """Dispatch a model reply to a review or a context request.
+
+    A reply carrying a top-level ``need_context`` list is the model asking
+    for more repository content before it can review. ``require_review=True``
+    rejects such replies with a parse error - used once the fetch budget is
+    exhausted, so the refusal falls into the normal model-fallback chain.
+    """
+    data = _load_yaml_object(text)
+    if "need_context" in data:
+        if require_review:
+            raise LLMError("bad_schema", "context requested after budget exhausted")
+        items = data.get("need_context")
+        if not isinstance(items, list) or not items:
+            raise LLMError("bad_schema", "need_context must be a non-empty list")
+        try:
+            return ContextRequest.model_validate({"items": items})
+        except ValidationError as exc:
+            raise LLMError("bad_schema", exc.errors()[0].get("msg", "invalid need_context")) from exc
     review = data.get("review", data)  # accept both nested and flat forms
     if not isinstance(review, dict):
         raise LLMError("bad_yaml", "missing 'review' mapping")
@@ -230,8 +293,14 @@ def chat(cfg: LLMConfig, system: str, user: str) -> tuple[str, str]:
     return text, finish_reason
 
 
-def review_with_fallback(cfg: LLMConfig, system: str, user: str, num_max_findings: int = 6) -> tuple[ReviewOutput, str]:
-    """Try each model until one returns a valid structured review."""
+def review_with_fallback(
+    cfg: LLMConfig, system: str, user: str, num_max_findings: int = 6, require_review: bool = False
+) -> tuple[ReviewOutput | ContextRequest, str]:
+    """Try each model until one returns a valid structured reply.
+
+    The reply may be a finished review or a ``need_context`` request (see
+    ``parse_response``); a parse/transport error moves on to the next model.
+    """
     errors: list[str] = []
     for model in (cfg.model, *cfg.fallback_models):
         attempt = LLMConfig(
@@ -244,7 +313,7 @@ def review_with_fallback(cfg: LLMConfig, system: str, user: str, num_max_finding
         )
         try:
             text, _ = chat(attempt, system, user)
-            return parse_review(text, num_max_findings), model
+            return parse_response(text, num_max_findings, require_review=require_review), model
         except LLMError as exc:
             errors.append(f"{model}: {exc}")
             logger.warning("review attempt failed for model %s: %s", model, exc)

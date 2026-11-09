@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote
 
 from django.test import TestCase
@@ -19,17 +19,19 @@ from .services.diffctx import (
 )
 from .services.gitlab import GitLabClient, GitLabError
 from .services.llm import (
+    ContextRequest,
     LLMConfig,
     LLMError,
     ReviewOutput,
     chat,
     extract_yaml_block,
     filter_unverified_absence_issues,
+    parse_response,
     parse_review,
     review_with_fallback,
 )
 from .services.prompts import build_system_prompt, build_user_prompt
-from .services.repoctx import build_repo_context, extract_symbols
+from .services.repoctx import build_repo_context, extract_symbols, fetch_requested_context, sanitize_repo_path
 from .services.render import (
     PROGRESS_MARKER,
     REVIEW_MARKER,
@@ -354,6 +356,88 @@ class RepoCtxTests(TestCase):
         self.assertFalse(stats["search_available"])
 
 
+class RequestedContextTests(TestCase):
+    """Model-issued need_context requests: path safety, caps, graceful skips."""
+
+    def _req(self, items: list[dict]) -> ContextRequest:
+        return ContextRequest.model_validate({"items": items})
+
+    def _fetch(self, client, req, exclude_paths=frozenset()):
+        return fetch_requested_context(
+            client, "g/r", "a" * 40, req, max_file_chars=20000, exclude_paths=set(exclude_paths)
+        )
+
+    def test_sanitize_repo_path(self):
+        self.assertEqual(sanitize_repo_path("src/a.py"), "src/a.py")
+        self.assertEqual(sanitize_repo_path(" /leading/slash.py "), "leading/slash.py")
+        self.assertEqual(sanitize_repo_path("../secret"), "")
+        self.assertEqual(sanitize_repo_path("a/../../b.py"), "")
+        self.assertEqual(sanitize_repo_path("C:\\win\\file.py"), "")
+        self.assertEqual(sanitize_repo_path(""), "")
+        self.assertEqual(sanitize_repo_path("   "), "")
+
+    def test_fetch_file_and_symbol(self):
+        req = self._req([
+            {"type": "file", "path": "src/gateway.py", "reason": "check retry"},
+            {"type": "search", "symbol": "refund_order", "reason": "find callers"},
+        ])
+        client = MagicMock()
+        client.get_file_content.return_value = "def charge():\n    pass\n"
+        client.search_blobs.return_value = [{"path": "src/other.py", "data": "refund_order(1)", "startline": 9}]
+        sections, stats = self._fetch(client, req, exclude_paths={"app.py"})
+        self.assertEqual(stats["files"], ["src/gateway.py"])
+        self.assertEqual(stats["symbols"], ["refund_order"])
+        self.assertEqual(len(sections), 2)
+        self.assertIn("Requested file: `src/gateway.py`", sections[0])
+        self.assertIn("    1  def charge():", sections[0])  # numbered lines stay citable
+        self.assertIn("请求理由：check retry", sections[0])
+        self.assertIn("src/other.py:9", sections[1])
+        client.get_file_content.assert_called_once_with("g/r", "src/gateway.py", "a" * 40)
+
+    def test_fetch_skips_diff_files_and_invalid_requests(self):
+        req = self._req([
+            {"type": "file", "path": "app.py"},         # already inside the diff
+            {"type": "file", "path": "../etc/passwd"},  # traversal refused
+            {"type": "search", "symbol": "1bad"},       # not an identifier
+            {"type": "file", "path": "src/ok.py"},
+        ])
+        client = MagicMock()
+        client.get_file_content.return_value = "x = 1\n"
+        sections, stats = self._fetch(client, req, exclude_paths={"app.py"})
+        self.assertEqual(stats["files"], ["src/ok.py"])
+        self.assertEqual(stats["skipped"], 3)
+        self.assertEqual(len(sections), 1)
+        client.get_file_content.assert_called_once()
+
+    def test_fetch_api_errors_skip(self):
+        req = self._req([
+            {"type": "file", "path": "src/missing.py"},
+            {"type": "search", "symbol": "ghost_sym"},
+        ])
+        client = MagicMock()
+        client.get_file_content.side_effect = GitLabError("GET raw returned 404", status=404)
+        client.search_blobs.side_effect = GitLabError("GET search returned 500", status=500)
+        sections, stats = self._fetch(client, req)
+        self.assertEqual(sections, [])
+        self.assertEqual(stats["skipped"], 2)
+
+    def test_fetch_caps_files_per_round(self):
+        req = self._req([{"type": "file", "path": f"src/f{i}.py"} for i in range(6)])
+        client = MagicMock()
+        client.get_file_content.return_value = "x = 1\n"
+        sections, stats = self._fetch(client, req)
+        self.assertEqual(len(stats["files"]), 4)  # MAX_REQUESTED_FILES
+        self.assertEqual(len(sections), 4)
+
+    def test_search_unavailable_skips_symbol(self):
+        req = self._req([{"type": "search", "symbol": "refund_order"}])
+        client = MagicMock()
+        client.search_blobs.return_value = None  # advanced search not enabled
+        sections, stats = self._fetch(client, req)
+        self.assertEqual(sections, [])
+        self.assertEqual(stats["skipped"], 1)
+
+
 class AbsenceFilterTests(TestCase):
     def _review_with(self, issue_yaml: str) -> ReviewOutput:
         return parse_review(
@@ -440,6 +524,14 @@ class PromptTests(TestCase):
         self.assertIn("REPOCTX-MARKER", user)
         self.assertNotIn("Repository context", build_user_prompt(**kwargs, diff_ctx=ctx))
 
+    def test_context_request_protocol_opt_in(self):
+        # default: the model must always answer with the review schema
+        self.assertNotIn("need_context", build_system_prompt(6, "zh-CN"))
+        system = build_system_prompt(6, "zh-CN", allow_context_requests=True)
+        self.assertIn("Context request protocol", system)
+        self.assertIn("need_context", system)
+        self.assertIn("zh-CN", system)  # request reasons follow the output language
+
 
 class LLMParseTests(TestCase):
     def test_extract_yaml_block(self):
@@ -505,6 +597,47 @@ class LLMParseTests(TestCase):
         with self.assertRaises(LLMError) as ctx:
             parse_review("just some text", num_max_findings=6)
         self.assertEqual(ctx.exception.reason, "bad_yaml")
+
+
+class ContextRequestParseTests(TestCase):
+    def test_parse_context_request(self):
+        req = parse_response(
+            "need_context:\n"
+            "  - type: file\n"
+            "    path: src/payments/gateway.py\n"
+            "    reason: confirm retry logic\n"
+            "  - type: search\n"
+            "    symbol: refund_order\n"
+            "    reason: find callers\n",
+            num_max_findings=6,
+        )
+        self.assertEqual([i.type for i in req.items], ["file", "search"])
+        self.assertEqual(req.items[0].path, "src/payments/gateway.py")
+        self.assertEqual(req.items[1].symbol, "refund_order")
+
+    def test_type_normalised_and_defaults(self):
+        req = parse_response("need_context:\n  - type: FILE\n    path: a.py\n  - symbol: sym\n", 6)
+        self.assertEqual([i.type for i in req.items], ["file", "file"])  # unknown type falls back to file
+        self.assertEqual(req.items[1].symbol, "sym")
+
+    def test_mixed_reply_counts_as_request_not_review(self):
+        req = parse_response("review:\n  score: 10\nneed_context:\n  - type: file\n    path: a.py\n", 6)
+        self.assertEqual(req.items[0].path, "a.py")
+
+    def test_empty_context_request_raises(self):
+        with self.assertRaises(LLMError) as ctx:
+            parse_response("need_context: []\n", 6)
+        self.assertEqual(ctx.exception.reason, "bad_schema")
+
+    def test_context_request_rejected_when_review_required(self):
+        with self.assertRaises(LLMError) as ctx:
+            parse_response("need_context:\n  - type: file\n    path: a.py\n", 6, require_review=True)
+        self.assertEqual(ctx.exception.reason, "bad_schema")
+
+    def test_parse_response_returns_review(self):
+        review = parse_response(f"```yaml\n{GOOD_REVIEW_YAML}```", 6)
+        self.assertIsInstance(review, ReviewOutput)
+        self.assertEqual(review.score, 88)
 
 
 class LLMChatTests(TestCase):
@@ -799,6 +932,52 @@ class PipelineTests(TestCase):
         record = ReviewRecord.objects.get()
         client.create_inline_discussion.assert_called_once()
         self.assertEqual(record.non_inline_issues, [])
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_need_context_round_fetches_then_reviews(self, client_cls, review_fn):
+        """need_context -> fetch over GitLab API -> second call returns the review."""
+        client = self._client_mock()
+        client.get_file_content.return_value = "def charge():\n    pass\n"
+        client_cls.return_value = client
+        request = ContextRequest.model_validate(
+            {"items": [{"type": "file", "path": "src/gateway.py", "reason": "check retry"}]}
+        )
+        review_fn.side_effect = [(request, "test-model"), (parse_review(GOOD_REVIEW_YAML, 6), "test-model")]
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(review_fn.call_count, 2)
+        # layer-1 enrichment already fetched app.py; exactly one extra fetch
+        # must come from the model's need_context request
+        requested = [c for c in client.get_file_content.call_args_list if c.args[1] == "src/gateway.py"]
+        self.assertEqual(requested, [call("backend/payments", "src/gateway.py", "a" * 40)])
+        ai_step = next(s for s in record.steps if s["step"] == "ai_review")
+        self.assertIn("主动补上下文 1 轮", ai_step["detail"])
+        self.assertIn("+1 文件", ai_step["detail"])
+        self.assertEqual(record.issues_count, 1)
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_context_budget_exhausted_forces_final_review(self, client_cls, review_fn):
+        """Unfetchable request -> one forced final call with the budget note, no loop."""
+        client = self._client_mock()
+        client.get_file_content.return_value = ""  # empty content -> nothing fetchable
+        client_cls.return_value = client
+        request = ContextRequest.model_validate({"items": [{"type": "file", "path": "src/gateway.py"}]})
+        review_fn.side_effect = [(request, "test-model"), (parse_review(GOOD_REVIEW_YAML, 6), "test-model")]
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(review_fn.call_count, 2)
+        forced_call = review_fn.call_args_list[1]
+        self.assertIn("budget is exhausted", forced_call.args[2])  # note appended to the user prompt
+        self.assertTrue(forced_call.kwargs.get("require_review"))
+        self.assertEqual(record.issues_count, 1)
 
     @patch("reviewer.services.pipeline.review_with_fallback")
     @patch("reviewer.services.pipeline.GitLabClient")
@@ -1160,6 +1339,12 @@ class ConfDbOverrideTests(TestCase):
             conf = reload_conf()
         self.assertFalse(conf.context_enrichment)
         self.assertEqual((conf.context_max_files, conf.context_max_file_chars, conf.context_max_symbols), (3, 5000, 2))
+
+    def test_context_fetch_rounds_env_db_and_clamp(self):
+        with patch.dict(os.environ, {"GITLABMR_CONTEXT_FETCH_ROUNDS": "9"}):
+            self.assertEqual(reload_conf().context_fetch_rounds, 3)  # code ceiling
+        Setting.objects.create(context_fetch_rounds=0)
+        self.assertEqual(reload_conf().context_fetch_rounds, 0)  # 0 = feature off
 
     def test_db_cannot_exceed_inline_and_findings_ceilings(self):
         Setting.objects.create(inline_max_comments=500, num_max_findings=100)

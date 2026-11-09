@@ -46,6 +46,7 @@ INT_FIELDS = (
     "max_comment_chars",
     "workers",
     "gitlab_timeout",
+    "context_fetch_rounds",
 )
 LLM_SETTING_GROUPS = [
     ("AI 模型", "OpenAI 兼容 /chat/completions 接口", (
@@ -67,6 +68,8 @@ LLM_SETTING_GROUPS = [
         ("review_on_push", "推送新提交时重新评审", "tristate", "MR update 且带 new commit 时触发"),
         ("ignore_branches", "忽略目标分支", "text", "逗号分隔，如 test,staging"),
         ("language", "评审输出语言", "text", "如 zh-CN"),
+        ("context_fetch_rounds", "主动补上下文轮数", "number",
+         "信息不足时模型可返回 need_context，后端拉取文件/符号后再评（0 = 关闭，最大 3）"),
         ("workers", "后台线程数", "number", "评审线程池大小（改后需重启进程生效）"),
         ("gitlab_timeout", "GitLab 超时（秒）", "number", ""),
     )),

@@ -19,9 +19,16 @@ from ..conf import MAX_INLINE_COMMENTS, get_conf
 from ..models import ReviewRecord, try_register_review
 from .diffctx import DiffContext, build_diff_context, estimate_tokens
 from .gitlab import GitLabClient, GitLabError
-from .llm import KeyIssue, LLMConfig, LLMError, ReviewOutput, filter_unverified_absence_issues, review_with_fallback
+from .llm import (
+    KeyIssue,
+    LLMConfig,
+    LLMError,
+    ReviewOutput,
+    filter_unverified_absence_issues,
+    review_with_fallback,
+)
 from .prompts import build_system_prompt, build_user_prompt
-from .repoctx import build_repo_context
+from .repoctx import build_repo_context, fetch_requested_context
 from .render import (
     REVIEW_MARKER,
     render_failure,
@@ -44,6 +51,15 @@ STEP_LABELS = {
     "ai_review": "AI 评审",
     "publish": "回写评论",
 }
+
+# Appended once the need_context fetch budget is spent; the next reply is
+# parsed with require_review=True so a refusal to review falls into the
+# normal model-fallback chain instead of looping forever.
+CONTEXT_EXHAUSTED_NOTE = (
+    "\n\n## Note\nThe context request budget is exhausted - no further repository "
+    "content can be fetched. You MUST now answer with the final review YAML schema "
+    "based on the information you already have. Do NOT answer with need_context."
+)
 
 
 def get_executor() -> ThreadPoolExecutor:
@@ -227,9 +243,12 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
 
         progress_note_id = _create_progress_note(client, project_path, mr_iid)
 
-        # -- stage 4: AI review
+        # -- stage 4: AI review (with optional model-driven context fetch rounds)
         tracker.start("ai_review")
-        system = build_system_prompt(conf.num_max_findings, conf.language)
+        fetch_rounds = conf.context_fetch_rounds
+        system = build_system_prompt(
+            conf.num_max_findings, conf.language, allow_context_requests=fetch_rounds > 0
+        )
         user = build_user_prompt(
             title=mr.get("title", ""),
             description=mr.get("description", "") or "",
@@ -251,7 +270,51 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             timeout=conf.llm_timeout,
             max_output_tokens=conf.llm_max_output_tokens,
         )
-        review, model_used = review_with_fallback(llm_cfg, system, user, conf.num_max_findings)
+        exclude_paths = (
+            set(diff_ctx.reviewed_files) | set(diff_ctx.filtered_files) | set(diff_ctx.not_reviewed_files)
+        )
+        fetched_files: list[str] = []
+        fetched_symbols: list[str] = []
+        rounds_used = 0
+        while True:
+            reply, model_used = review_with_fallback(llm_cfg, system, user, conf.num_max_findings)
+            if isinstance(reply, ReviewOutput):
+                review = reply
+                break
+            # The model asked for more repository context via need_context.
+            if rounds_used >= fetch_rounds:
+                user += CONTEXT_EXHAUSTED_NOTE
+                review, model_used = review_with_fallback(
+                    llm_cfg, system, user, conf.num_max_findings, require_review=True
+                )
+                break
+            sections, fetch_stats = fetch_requested_context(
+                client,
+                project_path,
+                head_sha,
+                reply,
+                max_file_chars=conf.context_max_file_chars,
+                exclude_paths=exclude_paths,
+            )
+            rounds_used += 1
+            fetched_files.extend(fetch_stats["files"])
+            fetched_symbols.extend(fetch_stats["symbols"])
+            logger.info(
+                "context fetch round %d on %s!%s: +%d file(s) +%d symbol(s), %d skipped",
+                rounds_used, project_path, mr_iid,
+                len(fetch_stats["files"]), len(fetch_stats["symbols"]), fetch_stats["skipped"],
+            )
+            if not sections:
+                # Nothing could be fetched - force the final review now.
+                user += CONTEXT_EXHAUSTED_NOTE
+                review, model_used = review_with_fallback(
+                    llm_cfg, system, user, conf.num_max_findings, require_review=True
+                )
+                break
+            user += "\n\n## Additional context (fetched on model request)\n\n" + "\n\n".join(sections)
+            record.prompt_chars = len(system) + len(user)
+            tracker.persist(record)
+
         review, dropped_claims = filter_unverified_absence_issues(review)
         if dropped_claims:
             logger.info(
@@ -266,6 +329,11 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
         record.score = review.score
         record.risk_level = review.risk_level or ""
         ai_detail = f"模型 {model_used}，{len(review.key_issues_to_review)} 个问题"
+        if rounds_used:
+            ai_detail += (
+                f"（主动补上下文 {rounds_used} 轮："
+                f"+{len(fetched_files)} 文件 +{len(fetched_symbols)} 符号）"
+            )
         if dropped_claims:
             ai_detail += f"（已过滤 {len(dropped_claims)} 条无证据的缺失类断言）"
         tracker.done("ai_review", ai_detail)

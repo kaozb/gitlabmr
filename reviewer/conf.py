@@ -154,6 +154,9 @@ class Conf:
     context_max_files: int = 6
     context_max_file_chars: int = 20000
     context_max_symbols: int = 8
+    # Agentic fetch rounds: when the model answers need_context, extra files /
+    # symbol searches are pulled from GitLab and it reviews again (0 = off).
+    context_fetch_rounds: int = 1
 
 
 def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
@@ -224,6 +227,7 @@ def _load_env_conf() -> Conf:
         context_max_files=_env_int("GITLABMR_CONTEXT_MAX_FILES", 6),
         context_max_file_chars=_env_int("GITLABMR_CONTEXT_MAX_FILE_CHARS", 20000),
         context_max_symbols=_env_int("GITLABMR_CONTEXT_MAX_SYMBOLS", 8),
+        context_fetch_rounds=_env_int("GITLABMR_CONTEXT_FETCH_ROUNDS", 1),
     )
 
 
@@ -245,6 +249,7 @@ _INT_OVERRIDES = (
     "max_comment_chars",
     "workers",
     "gitlab_timeout",
+    "context_fetch_rounds",
 )
 _BOOL_OVERRIDES = ("inline_comments", "review_on_push")
 
@@ -317,6 +322,7 @@ def load_conf() -> Conf:
         conf,
         num_max_findings=_clamp_int(conf.num_max_findings, 1, MAX_FINDINGS, 6),
         inline_max_comments=_clamp_int(conf.inline_max_comments, 0, MAX_INLINE_COMMENTS, MAX_INLINE_COMMENTS),
+        context_fetch_rounds=_clamp_int(conf.context_fetch_rounds, 0, 3, 1),
     )
 
 
