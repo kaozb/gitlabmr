@@ -157,6 +157,9 @@ class Conf:
     # Agentic fetch rounds: when the model answers need_context, extra files /
     # symbol searches are pulled from GitLab and it reviews again (0 = off).
     context_fetch_rounds: int = 1
+    # Feed existing human review comments on the MR into the prompt as
+    # reference context (bot/system notes always filtered out).
+    human_comments_in_prompt: bool = True
 
 
 def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
@@ -228,6 +231,7 @@ def _load_env_conf() -> Conf:
         context_max_file_chars=_env_int("GITLABMR_CONTEXT_MAX_FILE_CHARS", 20000),
         context_max_symbols=_env_int("GITLABMR_CONTEXT_MAX_SYMBOLS", 8),
         context_fetch_rounds=_env_int("GITLABMR_CONTEXT_FETCH_ROUNDS", 1),
+        human_comments_in_prompt=_env_bool("GITLABMR_HUMAN_COMMENTS_IN_PROMPT", True),
     )
 
 
@@ -251,7 +255,7 @@ _INT_OVERRIDES = (
     "gitlab_timeout",
     "context_fetch_rounds",
 )
-_BOOL_OVERRIDES = ("inline_comments", "review_on_push")
+_BOOL_OVERRIDES = ("inline_comments", "review_on_push", "human_comments_in_prompt")
 
 
 def _apply_db_overrides(conf: Conf) -> Conf:

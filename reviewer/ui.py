@@ -36,7 +36,7 @@ from .services.tokens import resolve_repo_token
 PROBE_RESULTS_KEY = "repo_token_probe"  # session key: last token-probe outcome
 
 SECRET_FIELDS = ("llm_api_key",)
-BOOL_FIELDS = ("inline_comments", "review_on_push")
+BOOL_FIELDS = ("inline_comments", "review_on_push", "human_comments_in_prompt")
 INT_FIELDS = (
     "llm_max_output_tokens",
     "llm_timeout",
@@ -67,6 +67,8 @@ LLM_SETTING_GROUPS = [
         ("max_comment_chars", "评论长度上限（字符）", "number", "超出截断并保留隐藏标记"),
         ("inline_comments", "行内评论", "tristate", "开启后关键问题定位到文件+行发表"),
         ("review_on_push", "推送新提交时重新评审", "tristate", "MR update 且带 new commit 时触发"),
+        ("human_comments_in_prompt", "参考人类评审意见", "tristate",
+         "评审时读取 MR 中已有的评审评论作为参考上下文（机器人与系统消息自动过滤，默认开启）"),
         ("ignore_branches", "忽略目标分支", "text", "逗号分隔，如 test,staging"),
         ("language", "评审输出语言", "text", "如 zh-CN"),
         ("context_fetch_rounds", "主动补上下文轮数", "number",
