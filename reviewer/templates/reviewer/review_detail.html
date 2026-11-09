@@ -25,7 +25,7 @@
     </form>
     {% if record.model_used %}<span class="badge where">模型 {{ record.model_used }}</span>{% endif %}
     <span class="badge where">来源 {{ record.source }}</span>
-    {% if record.duration_ms %}<span class="badge where">耗时 {{ record.duration_ms }} ms</span>{% endif %}
+    {% if record.duration_ms %}<span class="badge where">耗时 {{ record.duration_s }}s</span>{% endif %}
     <span class="badge where">diff / prompt / 输出：{{ record.diff_chars }} / {{ record.prompt_chars }} / {{ record.completion_chars }} 字符</span>
   </div>
   <dl class="kv">

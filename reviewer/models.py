@@ -85,6 +85,11 @@ class ReviewRecord(models.Model):
     def __str__(self) -> str:
         return f"{self.project_path}!{self.mr_iid}@{self.head_sha[:8]}:{self.status}"
 
+    @property
+    def duration_s(self) -> float:
+        """Total duration in seconds (one decimal) - duration_ms is ms."""
+        return round(self.duration_ms / 1000, 1)
+
 
 class IssueFeedback(models.Model):
     """Human false-positive mark on one review finding.

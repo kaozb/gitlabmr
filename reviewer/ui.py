@@ -16,6 +16,7 @@ from __future__ import annotations
 import hmac
 import os
 from functools import wraps
+from hashlib import sha1
 from urllib.parse import quote, urlencode, urlparse
 
 from django.contrib import messages
@@ -335,18 +336,20 @@ def _issue_key(issue: dict) -> tuple[str, int, str]:
     )
 
 
-def _diff_anchor(mr_url: str, file_path: str, start_line: int) -> str:
-    """Deep link to the file/line in the GitLab diff view.
+def _diff_anchor(mr_url: str, file_path: str) -> str:
+    """Deep link to the file inside the GitLab diff view.
 
-    GitLab anchors replace every non-alphanumeric char of the path with "_"
-    and append ``_L<line>``; even if an anchor drifts, the link still opens
-    the correct diff page.
+    Modern GitLab (13.x through current master) anchors diff files by
+    ``file_hash`` = ``sha1(file_path)`` (lib/gitlab/diff/file.rb), and the
+    diffs page supports ``?file=<hash>#diff-content-<hash>`` to jump straight
+    to that file. The legacy ``#_<path>_L<line>`` anchors are dead there, and
+    line-precise ``line_code`` anchors need blob SHAs we do not persist - so
+    the file is the accurate, version-stable target.
     """
-    if not mr_url:
+    if not mr_url or not file_path:
         return ""
-    anchor = "".join(c if c.isalnum() else "_" for c in file_path)
-    line = f"_L{start_line}" if start_line else ""
-    return f"{mr_url}/diffs#{anchor}{line}"
+    file_hash = sha1(file_path.encode("utf-8")).hexdigest()
+    return f"{mr_url}/diffs?file={file_hash}#diff-content-{file_hash}"
 
 
 @ui_login_required
@@ -377,7 +380,7 @@ def review_detail(request, pk):
                 "kind": issue.get("kind", ""),
                 "evidence": issue.get("evidence", ""),
                 "published": "summary" if _issue_key(issue) in summary_only_keys else "inline",
-                "diff_url": _diff_anchor(record.mr_url, issue.get("relevant_file", ""), start_line),
+                "diff_url": _diff_anchor(record.mr_url, issue.get("relevant_file", "")),
                 "feedback": feedback_marks.get(_issue_key(issue)),
             }
         )
@@ -392,7 +395,13 @@ def review_detail(request, pk):
 @require_POST
 def retry_review(request, pk):
     record = get_object_or_404(ReviewRecord, pk=pk)
-    if record.status == "running":
+    # Guard the whole MR, not just this record: while a review of a newer
+    # commit is in flight, a forced rerun would reset that running row and let
+    # two pipeline threads write to it concurrently.
+    in_flight = ReviewRecord.objects.filter(
+        project_path=record.project_path, mr_iid=record.mr_iid, status="running"
+    ).exists()
+    if in_flight:
         messages.warning(request, "该 MR 正在评审中，请等待本次完成后再重新评审")
         return redirect("reviewer:review-detail", pk=pk)
     submit_review(record.project_path, record.mr_iid, source="manual", force=True)

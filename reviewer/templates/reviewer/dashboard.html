@@ -85,7 +85,7 @@
         <td><span class="badge {{ r.status }}" {% if r.error_detail %}title="{{ r.error_detail }}"{% endif %}>{{ r.status }}</span></td>
         <td>{% if r.score %}{{ r.score }}{% else %}—{% endif %}</td>
         <td>{% if r.risk_level %}<span class="risk-{{ r.risk_level }}">{{ r.risk_level }}</span>{% else %}—{% endif %}</td>
-        <td class="muted">{% if r.duration_ms %}{{ r.duration_ms|floatformat:1 }}s{% else %}—{% endif %}</td>
+        <td class="muted">{% if r.duration_ms %}{{ r.duration_s }}s{% else %}—{% endif %}</td>
         <td>
           <a class="btn small" href="{% url 'reviewer:review-detail' r.pk %}">详情</a>
           {% if r.status != "running" %}

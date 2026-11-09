@@ -631,7 +631,7 @@ def _publish_inline_comments(
                 issue.relevant_file,
             )
             continue
-        if (issue.relevant_file, issue.start_line - 1) in existing:
+        if (issue.relevant_file, issue.start_line) in existing:
             published.add(index)
             continue
         position = {
@@ -641,7 +641,9 @@ def _publish_inline_comments(
             "head_sha": head_sha,
             "new_path": issue.relevant_file,
             "old_path": issue.relevant_file,
-            "new_line": issue.start_line - 1,  # GitLab positions are 0-based
+            # 1-based new-file line number, same scale as diffctx's numbering
+            # (GitLab docs: position[new_line] = "the line number after change").
+            "new_line": issue.start_line,
         }
         body = f"{issue.issue_content.strip()}\n<!-- gitlabmr:inline -->"
         try:

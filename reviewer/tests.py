@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from unittest.mock import MagicMock, call, patch
@@ -1199,7 +1200,7 @@ class PipelineTests(TestCase):
         run_review("backend/payments", 1)
         client.create_inline_discussion.assert_called_once()
         position = client.create_inline_discussion.call_args.args[3]
-        self.assertEqual(position["new_line"], 1)  # 0-based
+        self.assertEqual(position["new_line"], 2)  # 1-based new-file line, same as start_line
         self.assertEqual(position["base_sha"], "b")
         self.assertEqual(position["head_sha"], "h")
         # issue published inline is removed from the summary comment
@@ -1749,8 +1750,10 @@ class DashboardTests(TestCase):
         self.assertContains(resp, "verified")
         self.assertContains(resp, "app.py:2 uses x")
         self.assertContains(resp, "总结评论")
-        # deep link into the GitLab diff view at the finding's line
-        self.assertContains(resp, f"{record.mr_url}/diffs#app_py_L2")
+        # deep link into the GitLab diff view at the finding's file
+        # (GitLab anchors diff files by sha1(file_path), see lib/gitlab/diff/file.rb)
+        file_hash = hashlib.sha1(b"app.py").hexdigest()
+        self.assertContains(resp, f"{record.mr_url}/diffs?file={file_hash}#diff-content-{file_hash}")
         self.assertContains(resp, "标记误报")
 
     def test_detail_shows_all_issues_with_publish_channel(self):
@@ -1767,7 +1770,8 @@ class DashboardTests(TestCase):
         self.assertContains(resp, "Style")
         self.assertContains(resp, "行内评论")
         self.assertContains(resp, "总结评论")
-        self.assertContains(resp, f"{record.mr_url}/diffs#src_util_py_L7")
+        file_hash = hashlib.sha1(b"src/util.py").hexdigest()
+        self.assertContains(resp, f"{record.mr_url}/diffs?file={file_hash}#diff-content-{file_hash}")
 
     def test_feedback_mark_unmark_roundtrip(self):
         """误报标记：mark 落库去重，unmark 删除，重复 mark 只留一条。"""
@@ -1802,6 +1806,15 @@ class DashboardTests(TestCase):
 
     def test_retry_blocked_while_running(self):
         record = self._record(status="running")
+        with patch("reviewer.ui.submit_review") as submit:
+            resp = self.client.post(f"/reviews/{record.pk}/retry/")
+        submit.assert_not_called()
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+
+    def test_retry_blocked_while_another_commit_is_running(self):
+        """Retrying an old record must not disturb a newer in-flight review."""
+        record = self._record(status="success", head_sha="a" * 40)
+        self._record(status="running", head_sha="b" * 40)
         with patch("reviewer.ui.submit_review") as submit:
             resp = self.client.post(f"/reviews/{record.pk}/retry/")
         submit.assert_not_called()
