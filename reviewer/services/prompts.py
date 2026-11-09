@@ -92,9 +92,33 @@ Judging rules:
 {schema}"""
 
 
-def build_system_prompt(num_max_findings: int, language: str) -> str:
+CONTEXT_PROTOCOL_TEMPLATE = """Context request protocol (active for this review):
+- If, and only if, you genuinely cannot produce reliable findings without
+  seeing more of the repository, answer with a single YAML object that has
+  exactly one key `need_context`: a list of at most 6 items, each either
+    - type: file
+      path: <repo-relative path of the file you need, as stored in the repo>
+      reason: <one short sentence, in {language}, saying what you need to verify>
+    - type: search
+      symbol: <identifier to look up across the repository>
+      reason: <one short sentence, in {language}>
+- Ask only for content you actually need to confirm or refute a finding;
+  never re-request the diff, MR metadata, or files already shown above.
+- Use it sparingly: every request costs an extra round. If the visible
+  information is sufficient, or the concern is only about the changed lines
+  themselves, answer with the review schema directly.
+- A context request must never be mixed with a review. The next message you
+  receive will contain the requested content; then you must answer with the
+  review schema.
+"""
+
+
+def build_system_prompt(num_max_findings: int, language: str, allow_context_requests: bool = False) -> str:
     schema = SCHEMA_TEMPLATE.format(num_max_findings=num_max_findings)
-    return SYSTEM_TEMPLATE.format(language=language, schema=schema)
+    prompt = SYSTEM_TEMPLATE.format(language=language, schema=schema)
+    if allow_context_requests:
+        prompt += "\n" + CONTEXT_PROTOCOL_TEMPLATE.format(language=language)
+    return prompt
 
 
 def build_user_prompt(
@@ -107,6 +131,7 @@ def build_user_prompt(
     commit_messages: str,
     diff_ctx: DiffContext,
     repo_context: str = "",
+    known_false_positives: list[str] | None = None,
 ) -> str:
     inventory = build_inventory_section(diff_ctx)
     parts = [
@@ -119,6 +144,16 @@ def build_user_prompt(
         parts.append(f"Description:\n{description[:4000]}")
     if commit_messages:
         parts.append(f"Commit messages:\n{commit_messages[:2000]}")
+    if known_false_positives:
+        # Kept inside the stable prefix (before the diff): it changes rarely and
+        # must not bust the prompt cache on every round.
+        parts.append(
+            "\n## Human-marked false positives (do NOT report these again)\n"
+            "Repository maintainers marked the following earlier findings as false "
+            "positives. Do not report them again unless you have NEW concrete "
+            "evidence that the problem really exists:\n"
+            + "\n".join(f"- {line}" for line in known_false_positives)
+        )
     parts.append("\n## Diff (new-file line numbers on the left)\n")
     parts.append(diff_ctx.diff_text)
     if repo_context:

@@ -16,12 +16,19 @@ from concurrent.futures import ThreadPoolExecutor
 from django.db import close_old_connections
 
 from ..conf import MAX_INLINE_COMMENTS, get_conf
-from ..models import ReviewRecord, try_register_review
+from ..models import IssueFeedback, ReviewRecord, try_register_review
 from .diffctx import DiffContext, build_diff_context, estimate_tokens
 from .gitlab import GitLabClient, GitLabError
-from .llm import KeyIssue, LLMConfig, LLMError, ReviewOutput, filter_unverified_absence_issues, review_with_fallback
+from .llm import (
+    KeyIssue,
+    LLMConfig,
+    LLMError,
+    ReviewOutput,
+    filter_unverified_absence_issues,
+    review_with_fallback,
+)
 from .prompts import build_system_prompt, build_user_prompt
-from .repoctx import build_repo_context
+from .repoctx import build_repo_context, fetch_requested_context
 from .render import (
     REVIEW_MARKER,
     render_failure,
@@ -44,6 +51,15 @@ STEP_LABELS = {
     "ai_review": "AI 评审",
     "publish": "回写评论",
 }
+
+# Appended once the need_context fetch budget is spent; the next reply is
+# parsed with require_review=True so a refusal to review falls into the
+# normal model-fallback chain instead of looping forever.
+CONTEXT_EXHAUSTED_NOTE = (
+    "\n\n## Note\nThe context request budget is exhausted - no further repository "
+    "content can be fetched. You MUST now answer with the final review YAML schema "
+    "based on the information you already have. Do NOT answer with need_context."
+)
 
 
 def get_executor() -> ThreadPoolExecutor:
@@ -170,6 +186,12 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
     if record is None:
         logger.info("review already recorded/in-flight for %s!%s@%s", project_path, mr_iid, head_sha[:8])
         return
+    # MR snapshot for the detail page / dashboard search (best-effort fields).
+    record.mr_title = (mr.get("title") or "")[:512]
+    record.author = ((mr.get("author") or {}).get("name") or "")[:128]
+    record.source_branch = (mr.get("source_branch") or "")[:256]
+    record.target_branch = (mr.get("target_branch") or "")[:256]
+    record.save(update_fields=["mr_title", "author", "source_branch", "target_branch", "updated_at"])
     tracker.persist(record)
 
     progress_note_id: int | None = None
@@ -227,9 +249,12 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
 
         progress_note_id = _create_progress_note(client, project_path, mr_iid)
 
-        # -- stage 4: AI review
+        # -- stage 4: AI review (with optional model-driven context fetch rounds)
         tracker.start("ai_review")
-        system = build_system_prompt(conf.num_max_findings, conf.language)
+        fetch_rounds = conf.context_fetch_rounds
+        system = build_system_prompt(
+            conf.num_max_findings, conf.language, allow_context_requests=fetch_rounds > 0
+        )
         user = build_user_prompt(
             title=mr.get("title", ""),
             description=mr.get("description", "") or "",
@@ -239,6 +264,7 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             commit_messages=mr.get("merge_commit_message", "") or "",
             diff_ctx=diff_ctx,
             repo_context=repo_context,
+            known_false_positives=_false_positive_lines(project_path, set(diff_ctx.reviewed_files)),
         )
         record.prompt_chars = len(system) + len(user)
         tracker.persist(record)
@@ -251,7 +277,51 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             timeout=conf.llm_timeout,
             max_output_tokens=conf.llm_max_output_tokens,
         )
-        review, model_used = review_with_fallback(llm_cfg, system, user, conf.num_max_findings)
+        exclude_paths = (
+            set(diff_ctx.reviewed_files) | set(diff_ctx.filtered_files) | set(diff_ctx.not_reviewed_files)
+        )
+        fetched_files: list[str] = []
+        fetched_symbols: list[str] = []
+        rounds_used = 0
+        while True:
+            reply, model_used = review_with_fallback(llm_cfg, system, user, conf.num_max_findings)
+            if isinstance(reply, ReviewOutput):
+                review = reply
+                break
+            # The model asked for more repository context via need_context.
+            if rounds_used >= fetch_rounds:
+                user += CONTEXT_EXHAUSTED_NOTE
+                review, model_used = review_with_fallback(
+                    llm_cfg, system, user, conf.num_max_findings, require_review=True
+                )
+                break
+            sections, fetch_stats = fetch_requested_context(
+                client,
+                project_path,
+                head_sha,
+                reply,
+                max_file_chars=conf.context_max_file_chars,
+                exclude_paths=exclude_paths,
+            )
+            rounds_used += 1
+            fetched_files.extend(fetch_stats["files"])
+            fetched_symbols.extend(fetch_stats["symbols"])
+            logger.info(
+                "context fetch round %d on %s!%s: +%d file(s) +%d symbol(s), %d skipped",
+                rounds_used, project_path, mr_iid,
+                len(fetch_stats["files"]), len(fetch_stats["symbols"]), fetch_stats["skipped"],
+            )
+            if not sections:
+                # Nothing could be fetched - force the final review now.
+                user += CONTEXT_EXHAUSTED_NOTE
+                review, model_used = review_with_fallback(
+                    llm_cfg, system, user, conf.num_max_findings, require_review=True
+                )
+                break
+            user += "\n\n## Additional context (fetched on model request)\n\n" + "\n\n".join(sections)
+            record.prompt_chars = len(system) + len(user)
+            tracker.persist(record)
+
         review, dropped_claims = filter_unverified_absence_issues(review)
         if dropped_claims:
             logger.info(
@@ -265,7 +335,25 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
         record.issues_count = len(review.key_issues_to_review)
         record.score = review.score
         record.risk_level = review.risk_level or ""
+        # full finding list for the detail page (inline + summary-only)
+        record.key_issues = [
+            {
+                "relevant_file": i.relevant_file,
+                "start_line": i.start_line,
+                "end_line": i.end_line,
+                "issue_header": i.issue_header,
+                "issue_content": i.issue_content,
+                "kind": i.kind,
+                "evidence": i.evidence,
+            }
+            for i in review.key_issues_to_review
+        ]
         ai_detail = f"模型 {model_used}，{len(review.key_issues_to_review)} 个问题"
+        if rounds_used:
+            ai_detail += (
+                f"（主动补上下文 {rounds_used} 轮："
+                f"+{len(fetched_files)} 文件 +{len(fetched_symbols)} 符号）"
+            )
         if dropped_claims:
             ai_detail += f"（已过滤 {len(dropped_claims)} 条无证据的缺失类断言）"
         tracker.done("ai_review", ai_detail)
@@ -306,6 +394,8 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
             filtered_files=diff_ctx.filtered_files,
             language=conf.language,
         )
+        record.summary_comment = body  # exact snapshot shown on the detail page
+        record.completion_chars = len(body)
         mode = _publish_persistent_comment(client, project_path, mr_iid, body, conf.max_comment_chars)
         publish_detail = mode if not inline_published else f"{mode}（{len(inline_published)} 条行内评论）"
         tracker.done("publish", publish_detail)
@@ -346,6 +436,30 @@ def run_review(project_path: str, mr_iid: int, source: str = "webhook", force: b
 
 
 # ---------------------------------------------------------------- helpers
+
+
+FP_LOOKUP_LIMIT = 200  # recent marks scanned per review (then relevance-sorted)
+FP_PROMPT_LIMIT = 30  # lines actually injected into the prompt
+
+
+def _false_positive_lines(project_path: str, changed_files: set[str]) -> list[str]:
+    """Human-marked false positives of this repo, formatted for the prompt.
+
+    Marks on files present in this MR's diff come first (most likely to be
+    re-reported); recency breaks ties. Bounded so a heavily-marked repo can
+    neither flood the prompt nor grow it without limit.
+    """
+    recent = list(IssueFeedback.objects.filter(project_path=project_path).order_by("-created_at")[:FP_LOOKUP_LIMIT])
+    if not recent:
+        return []
+    recent.sort(key=lambda f: f.relevant_file not in changed_files)
+    lines: list[str] = []
+    for mark in recent[:FP_PROMPT_LIMIT]:
+        loc = f"`{mark.relevant_file}`"
+        if mark.start_line:
+            loc += f" L{mark.start_line}" + (f"-L{mark.end_line}" if mark.end_line > mark.start_line else "")
+        lines.append(f"{loc} {mark.issue_header}（人工已判定为误报）".strip())
+    return lines
 
 
 def _total_ms(tracker: StepTracker) -> int:
@@ -517,7 +631,7 @@ def _publish_inline_comments(
                 issue.relevant_file,
             )
             continue
-        if (issue.relevant_file, issue.start_line - 1) in existing:
+        if (issue.relevant_file, issue.start_line) in existing:
             published.add(index)
             continue
         position = {
@@ -527,7 +641,9 @@ def _publish_inline_comments(
             "head_sha": head_sha,
             "new_path": issue.relevant_file,
             "old_path": issue.relevant_file,
-            "new_line": issue.start_line - 1,  # GitLab positions are 0-based
+            # 1-based new-file line number, same scale as diffctx's numbering
+            # (GitLab docs: position[new_line] = "the line number after change").
+            "new_line": issue.start_line,
         }
         body = f"{issue.issue_content.strip()}\n<!-- gitlabmr:inline -->"
         try:

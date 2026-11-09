@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
+from .models import IssueFeedback, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent
 
 
 @admin.register(WebhookEvent)
@@ -20,6 +20,15 @@ class ReviewRecordAdmin(admin.ModelAdmin):
     list_filter = ("status", "risk_level", "source")
     search_fields = ("project_path", "mr_url")
     readonly_fields = [f.name for f in ReviewRecord._meta.fields]
+
+
+@admin.register(IssueFeedback)
+class IssueFeedbackAdmin(admin.ModelAdmin):
+    list_display = ("id", "project_path", "mr_iid", "relevant_file", "start_line", "issue_header",
+                    "marked_by", "created_at")
+    list_filter = ("project_path",)
+    search_fields = ("project_path", "relevant_file", "issue_header")
+    readonly_fields = [f.name for f in IssueFeedback._meta.fields]
 
 
 @admin.register(RepoTokenEntry)

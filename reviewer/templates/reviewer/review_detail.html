@@ -1,32 +1,35 @@
 {% extends "reviewer/base.html" %}
 {% block title %}评审详情 · {{ record.project_path }}!{{ record.mr_iid }}{% endblock %}
 {% block content %}
-<h1>{{ record.project_path }}!<span class="mono">{{ record.mr_iid }}</span></h1>
-<p class="sub">
-  <span class="badge {{ record.status }}">{{ record.status }}</span>
-  &nbsp;{% if record.mr_url %}<a href="{{ record.mr_url }}" target="_blank">在 GitLab 中打开 ↗</a>{% endif %}
-  &nbsp;<a href="{% url 'reviewer:dashboard' %}">← 返回总览</a>
-</p>
+<p style="margin:0 0 10px"><a href="{% url 'reviewer:dashboard' %}">← 返回总览</a></p>
 
 <div class="card">
-  <div class="card-head">
-    <h2>评审结果</h2>
+  <div class="title-row">
+    <h1>{{ record.mr_title|default:"（未记录 MR 标题）" }}</h1>
+    <span class="badge {{ record.status }}">{{ record.status }}</span>
+    {% if record.score %}<span class="score-pill">评分 {{ record.score }}/100</span>{% endif %}
+    {% if record.risk_level %}<span class="risk-{{ record.risk_level }}">风险 {{ record.risk_level }}</span>{% endif %}
+  </div>
+  <div class="badge-row">
+    <span class="mono">{{ record.project_path }}!{{ record.mr_iid }}</span>
+    {% if record.mr_url %}<a href="{{ record.mr_url }}" target="_blank">在 GitLab 中打开 ↗</a>{% endif %}
+    <span class="muted">·</span>
+    <span>作者：{{ record.author|default:"—" }}</span>
+    <span class="muted">·</span>
+    <span class="mono">{{ record.source_branch|default:"—" }} → {{ record.target_branch|default:"—" }}</span>
+  </div>
+  <div class="badge-row" style="margin-bottom:10px">
     <form method="post" action="{% url 'reviewer:review-retry' record.pk %}">
       {% csrf_token %}<button class="btn primary small" type="submit"
       onclick="return confirm('强制重新评审该 MR？将忽略已有的评审记录。')">重新评审</button>
     </form>
+    {% if record.model_used %}<span class="badge where">模型 {{ record.model_used }}</span>{% endif %}
+    <span class="badge where">来源 {{ record.source }}</span>
+    {% if record.duration_ms %}<span class="badge where">耗时 {{ record.duration_s }}s</span>{% endif %}
+    <span class="badge where">diff / prompt / 输出：{{ record.diff_chars }} / {{ record.prompt_chars }} / {{ record.completion_chars }} 字符</span>
   </div>
   <dl class="kv">
-    <dt>head sha</dt><dd class="mono">{{ record.head_sha }}</dd>
-    <dt>评分 / 风险</dt>
-    <dd>{% if record.score %}{{ record.score }} 分{% else %}—{% endif %}
-        {% if record.risk_level %} · <span class="risk-{{ record.risk_level }}">{{ record.risk_level }}</span>{% endif %}</dd>
-    <dt>问题数</dt><dd>{{ record.issues_count }}</dd>
-    <dt>模型</dt><dd class="mono">{{ record.model_used|default:"—" }}</dd>
-    <dt>触发来源</dt><dd>{{ record.source }}</dd>
-    <dt>耗时</dt><dd>{% if record.duration_ms %}{{ record.duration_ms }} ms{% else %}—{% endif %}</dd>
-    <dt>diff / prompt / 输出</dt>
-    <dd>{{ record.diff_chars }} / {{ record.prompt_chars }} / {{ record.completion_chars }} 字符</dd>
+    <dt>head sha</dt><dd class="mono">{{ record.head_sha|default:"（未获取到）" }}</dd>
     <dt>创建 / 更新</dt><dd>{{ record.created_at|date:"Y-m-d H:i:s" }} → {{ record.updated_at|date:"Y-m-d H:i:s" }}</dd>
     {% if record.error_reason %}
     <dt>失败原因</dt><dd><span class="badge failed">{{ record.error_reason }}</span></dd>
@@ -61,20 +64,85 @@
   {% endif %}
 </div>
 
-<style>
-  /* non-inline review issues panel */
-  ul.non-inline-issues { list-style: none; margin: 0; padding: 0; font-size: 13px; }
-  ul.non-inline-issues li { padding: 10px 0; border-bottom: 1px solid #f0f2f7; }
-  ul.non-inline-issues li:last-child { border-bottom: none; padding-bottom: 0; }
-  ul.non-inline-issues li:first-child { padding-top: 0; }
-  .issue-title { display: flex; align-items: center; gap: 8px; }
-  .issue-title .badge.verified { background: var(--err-bg); color: var(--err); }
-  .issue-title .badge.suggestion { background: var(--info-bg); color: var(--info); }
-  .issue-loc { margin: 2px 0 4px; color: var(--muted); }
-  .issue-content { white-space: pre-wrap; word-break: break-word; }
-  .issue-evidence { margin: 6px 0 0; padding: 4px 10px; border-left: 3px solid var(--line);
-    color: var(--muted); font-size: 12px; word-break: break-word; }
-</style>
+<div class="card">
+  <div class="card-head">
+    <h2>评审发现（{{ issues|length }}）</h2>
+    <span class="muted">verified = 已结合仓库上下文证实；suggestion = 仅针对变更行本身。误报标记会让同仓库后续评审不再重复上报。</span>
+  </div>
+  {% if issues %}
+  <ul class="issue-list">
+    {% for i in issues %}
+    <li class="issue-card {% if i.feedback %}fp-marked{% endif %}">
+      <div class="issue-head">
+        <span class="idx">#{{ i.index }}</span>
+        <strong>{{ i.issue_header|default:"Issue" }}</strong>
+        {% if i.kind %}<span class="badge kind-{{ i.kind }}">{{ i.kind }}</span>{% endif %}
+        <span class="badge where">{% if i.published == "summary" %}总结评论{% else %}行内评论{% endif %}</span>
+        {% if i.feedback %}<span class="badge fpmarked">已标记误报（{{ i.feedback.marked_by|default:"匿名" }}）</span>{% endif %}
+      </div>
+      <div class="issue-loc mono">
+        {% if i.diff_url %}<a href="{{ i.diff_url }}" target="_blank">{{ i.relevant_file }}{% if i.location %} {{ i.location }}{% endif %} ↗</a>
+        {% else %}{{ i.relevant_file }}{% if i.location %} {{ i.location }}{% endif %}{% endif %}
+      </div>
+      <div class="issue-content">{{ i.issue_content }}</div>
+      {% if i.evidence %}<blockquote class="issue-evidence">证据：{{ i.evidence }}</blockquote>{% endif %}
+      <div class="issue-actions">
+        {% if i.feedback %}
+        <form class="inline" method="post" action="{% url 'reviewer:review-feedback' record.pk %}"
+              onsubmit="return confirm('撤销这条误报标记？后续评审可能再次上报类似问题。')">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="unmark">
+          <input type="hidden" name="file" value="{{ i.relevant_file }}">
+          <input type="hidden" name="start_line" value="{{ i.start_line }}">
+          <input type="hidden" name="end_line" value="{{ i.end_line }}">
+          <input type="hidden" name="header" value="{{ i.issue_header }}">
+          <button class="btn small" type="submit">撤销误报标记</button>
+        </form>
+        {% else %}
+        <form class="inline" method="post" action="{% url 'reviewer:review-feedback' record.pk %}"
+              onsubmit="return confirm('标记为误报？同仓库后续评审将不再重复上报此类问题。')">
+          {% csrf_token %}
+          <input type="hidden" name="action" value="mark">
+          <input type="hidden" name="file" value="{{ i.relevant_file }}">
+          <input type="hidden" name="start_line" value="{{ i.start_line }}">
+          <input type="hidden" name="end_line" value="{{ i.end_line }}">
+          <input type="hidden" name="header" value="{{ i.issue_header }}">
+          <button class="btn small" type="submit">标记误报</button>
+        </form>
+        {% endif %}
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <div class="empty">本次评审没有输出问题（或该记录由旧版本生成，未保存问题清单）</div>
+  {% endif %}
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <div class="card-head"><h2>已评审文件</h2><span class="muted">{{ record.reviewed_files|length }}</span></div>
+    {% if record.reviewed_files %}
+      <ul style="margin:0;padding-left:18px;font-size:13px">{% for f in record.reviewed_files %}<li class="mono">{{ f }}</li>{% endfor %}</ul>
+    {% else %}<div class="empty">无</div>{% endif %}
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>未纳入评审</h2><span class="muted">{{ record.not_reviewed_files|length }}</span></div>
+    {% if record.not_reviewed_files %}
+      <ul style="margin:0;padding-left:18px;font-size:13px">{% for f in record.not_reviewed_files %}<li class="mono">{{ f }}</li>{% endfor %}</ul>
+    {% else %}<div class="empty">无（全部文件都已评审）</div>{% endif %}
+  </div>
+</div>
+
+{% if record.summary_comment %}
+<div class="card">
+  <div class="card-head">
+    <h2>总结评论快照</h2>
+    <span class="muted">发布到 MR 的原文（Markdown 源码），可在 GitLab 中核对</span>
+  </div>
+  <pre class="comment-snapshot">{{ record.summary_comment }}</pre>
+</div>
+{% endif %}
 
 <script>
   function showStepDetail(el) {
@@ -92,37 +160,4 @@
     box.classList.remove("hidden");
   }
 </script>
-
-<div class="grid cols-3">
-  <div class="card">
-    <div class="card-head"><h2>已评审文件</h2><span class="muted">{{ record.reviewed_files|length }}</span></div>
-    {% if record.reviewed_files %}
-      <ul style="margin:0;padding-left:18px;font-size:13px">{% for f in record.reviewed_files %}<li class="mono">{{ f }}</li>{% endfor %}</ul>
-    {% else %}<div class="empty">无</div>{% endif %}
-  </div>
-  <div class="card">
-    <div class="card-head"><h2>未纳入评审</h2><span class="muted">{{ record.not_reviewed_files|length }}</span></div>
-    {% if record.not_reviewed_files %}
-      <ul style="margin:0;padding-left:18px;font-size:13px">{% for f in record.not_reviewed_files %}<li class="mono">{{ f }}</li>{% endfor %}</ul>
-    {% else %}<div class="empty">无（全部文件都已评审）</div>{% endif %}
-  </div>
-  <div class="card">
-    <div class="card-head"><h2>非行内评审意见</h2><span class="muted">{{ non_inline_issues|length }}</span></div>
-    {% if non_inline_issues %}
-      <ul class="non-inline-issues">
-        {% for i in non_inline_issues %}
-          <li>
-            <div class="issue-title">
-              <strong>{{ i.issue_header|default:"Issue" }}</strong>
-              {% if i.kind %}<span class="badge {{ i.kind }}">{{ i.kind }}</span>{% endif %}
-            </div>
-            <div class="mono issue-loc">{{ i.relevant_file }}{% if i.location %} {{ i.location }}{% endif %}</div>
-            <div class="issue-content">{{ i.issue_content }}</div>
-            {% if i.evidence %}<blockquote class="issue-evidence">{{ i.evidence }}</blockquote>{% endif %}
-          </li>
-        {% endfor %}
-      </ul>
-    {% else %}<div class="empty">无（全部意见都已行内发表，或本次未发现问题）</div>{% endif %}
-  </div>
-</div>
 {% endblock %}

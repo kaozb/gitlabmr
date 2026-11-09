@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from urllib.parse import quote
 
 from django.test import TestCase
 
 from .conf import MAX_FINDINGS, MAX_INLINE_COMMENTS, Conf, RepoToken, api_origin, get_conf, reload_conf
-from .models import RepoTokenEntry, ReviewRecord, Setting, WebhookEvent, try_register_review
+from .models import IssueFeedback, RepoTokenEntry, ReviewRecord, Setting, WebhookEvent, try_register_review
 from .services.diffctx import (
     build_diff_context,
     build_inventory_section,
@@ -19,17 +20,19 @@ from .services.diffctx import (
 )
 from .services.gitlab import GitLabClient, GitLabError
 from .services.llm import (
+    ContextRequest,
     LLMConfig,
     LLMError,
     ReviewOutput,
     chat,
     extract_yaml_block,
     filter_unverified_absence_issues,
+    parse_response,
     parse_review,
     review_with_fallback,
 )
 from .services.prompts import build_system_prompt, build_user_prompt
-from .services.repoctx import build_repo_context, extract_symbols
+from .services.repoctx import build_repo_context, extract_symbols, fetch_requested_context, sanitize_repo_path
 from .services.render import (
     PROGRESS_MARKER,
     REVIEW_MARKER,
@@ -354,6 +357,88 @@ class RepoCtxTests(TestCase):
         self.assertFalse(stats["search_available"])
 
 
+class RequestedContextTests(TestCase):
+    """Model-issued need_context requests: path safety, caps, graceful skips."""
+
+    def _req(self, items: list[dict]) -> ContextRequest:
+        return ContextRequest.model_validate({"items": items})
+
+    def _fetch(self, client, req, exclude_paths=frozenset()):
+        return fetch_requested_context(
+            client, "g/r", "a" * 40, req, max_file_chars=20000, exclude_paths=set(exclude_paths)
+        )
+
+    def test_sanitize_repo_path(self):
+        self.assertEqual(sanitize_repo_path("src/a.py"), "src/a.py")
+        self.assertEqual(sanitize_repo_path(" /leading/slash.py "), "leading/slash.py")
+        self.assertEqual(sanitize_repo_path("../secret"), "")
+        self.assertEqual(sanitize_repo_path("a/../../b.py"), "")
+        self.assertEqual(sanitize_repo_path("C:\\win\\file.py"), "")
+        self.assertEqual(sanitize_repo_path(""), "")
+        self.assertEqual(sanitize_repo_path("   "), "")
+
+    def test_fetch_file_and_symbol(self):
+        req = self._req([
+            {"type": "file", "path": "src/gateway.py", "reason": "check retry"},
+            {"type": "search", "symbol": "refund_order", "reason": "find callers"},
+        ])
+        client = MagicMock()
+        client.get_file_content.return_value = "def charge():\n    pass\n"
+        client.search_blobs.return_value = [{"path": "src/other.py", "data": "refund_order(1)", "startline": 9}]
+        sections, stats = self._fetch(client, req, exclude_paths={"app.py"})
+        self.assertEqual(stats["files"], ["src/gateway.py"])
+        self.assertEqual(stats["symbols"], ["refund_order"])
+        self.assertEqual(len(sections), 2)
+        self.assertIn("Requested file: `src/gateway.py`", sections[0])
+        self.assertIn("    1  def charge():", sections[0])  # numbered lines stay citable
+        self.assertIn("请求理由：check retry", sections[0])
+        self.assertIn("src/other.py:9", sections[1])
+        client.get_file_content.assert_called_once_with("g/r", "src/gateway.py", "a" * 40)
+
+    def test_fetch_skips_diff_files_and_invalid_requests(self):
+        req = self._req([
+            {"type": "file", "path": "app.py"},         # already inside the diff
+            {"type": "file", "path": "../etc/passwd"},  # traversal refused
+            {"type": "search", "symbol": "1bad"},       # not an identifier
+            {"type": "file", "path": "src/ok.py"},
+        ])
+        client = MagicMock()
+        client.get_file_content.return_value = "x = 1\n"
+        sections, stats = self._fetch(client, req, exclude_paths={"app.py"})
+        self.assertEqual(stats["files"], ["src/ok.py"])
+        self.assertEqual(stats["skipped"], 3)
+        self.assertEqual(len(sections), 1)
+        client.get_file_content.assert_called_once()
+
+    def test_fetch_api_errors_skip(self):
+        req = self._req([
+            {"type": "file", "path": "src/missing.py"},
+            {"type": "search", "symbol": "ghost_sym"},
+        ])
+        client = MagicMock()
+        client.get_file_content.side_effect = GitLabError("GET raw returned 404", status=404)
+        client.search_blobs.side_effect = GitLabError("GET search returned 500", status=500)
+        sections, stats = self._fetch(client, req)
+        self.assertEqual(sections, [])
+        self.assertEqual(stats["skipped"], 2)
+
+    def test_fetch_caps_files_per_round(self):
+        req = self._req([{"type": "file", "path": f"src/f{i}.py"} for i in range(6)])
+        client = MagicMock()
+        client.get_file_content.return_value = "x = 1\n"
+        sections, stats = self._fetch(client, req)
+        self.assertEqual(len(stats["files"]), 4)  # MAX_REQUESTED_FILES
+        self.assertEqual(len(sections), 4)
+
+    def test_search_unavailable_skips_symbol(self):
+        req = self._req([{"type": "search", "symbol": "refund_order"}])
+        client = MagicMock()
+        client.search_blobs.return_value = None  # advanced search not enabled
+        sections, stats = self._fetch(client, req)
+        self.assertEqual(sections, [])
+        self.assertEqual(stats["skipped"], 1)
+
+
 class AbsenceFilterTests(TestCase):
     def _review_with(self, issue_yaml: str) -> ReviewOutput:
         return parse_review(
@@ -440,6 +525,29 @@ class PromptTests(TestCase):
         self.assertIn("REPOCTX-MARKER", user)
         self.assertNotIn("Repository context", build_user_prompt(**kwargs, diff_ctx=ctx))
 
+    def test_context_request_protocol_opt_in(self):
+        # default: the model must always answer with the review schema
+        self.assertNotIn("need_context", build_system_prompt(6, "zh-CN"))
+        system = build_system_prompt(6, "zh-CN", allow_context_requests=True)
+        self.assertIn("Context request protocol", system)
+        self.assertIn("need_context", system)
+        self.assertIn("zh-CN", system)  # request reasons follow the output language
+
+    def test_user_prompt_lists_marked_false_positives_before_diff(self):
+        """误报段落在 diff 之前（缓存友好），且逐条列出人工判定结果。"""
+        ctx = build_diff_context([{"new_path": "app.py", "old_path": "app.py", "diff": SAMPLE_PATCH}], max_tokens=10000)
+        kwargs = dict(
+            title="t", description="", author="a", source_branch="f", target_branch="m", commit_messages=""
+        )
+        user = build_user_prompt(
+            **kwargs, diff_ctx=ctx,
+            known_false_positives=["`app.py` L2 Bug（人工已判定为误报）"],
+        )
+        self.assertIn("Human-marked false positives", user)
+        self.assertIn("app.py` L2 Bug（人工已判定为误报）", user)
+        self.assertLess(user.index("false positives"), user.index("## Diff"))  # stable cache prefix
+        self.assertNotIn("false positives", build_user_prompt(**kwargs, diff_ctx=ctx))
+
 
 class LLMParseTests(TestCase):
     def test_extract_yaml_block(self):
@@ -507,6 +615,47 @@ class LLMParseTests(TestCase):
         self.assertEqual(ctx.exception.reason, "bad_yaml")
 
 
+class ContextRequestParseTests(TestCase):
+    def test_parse_context_request(self):
+        req = parse_response(
+            "need_context:\n"
+            "  - type: file\n"
+            "    path: src/payments/gateway.py\n"
+            "    reason: confirm retry logic\n"
+            "  - type: search\n"
+            "    symbol: refund_order\n"
+            "    reason: find callers\n",
+            num_max_findings=6,
+        )
+        self.assertEqual([i.type for i in req.items], ["file", "search"])
+        self.assertEqual(req.items[0].path, "src/payments/gateway.py")
+        self.assertEqual(req.items[1].symbol, "refund_order")
+
+    def test_type_normalised_and_defaults(self):
+        req = parse_response("need_context:\n  - type: FILE\n    path: a.py\n  - symbol: sym\n", 6)
+        self.assertEqual([i.type for i in req.items], ["file", "file"])  # unknown type falls back to file
+        self.assertEqual(req.items[1].symbol, "sym")
+
+    def test_mixed_reply_counts_as_request_not_review(self):
+        req = parse_response("review:\n  score: 10\nneed_context:\n  - type: file\n    path: a.py\n", 6)
+        self.assertEqual(req.items[0].path, "a.py")
+
+    def test_empty_context_request_raises(self):
+        with self.assertRaises(LLMError) as ctx:
+            parse_response("need_context: []\n", 6)
+        self.assertEqual(ctx.exception.reason, "bad_schema")
+
+    def test_context_request_rejected_when_review_required(self):
+        with self.assertRaises(LLMError) as ctx:
+            parse_response("need_context:\n  - type: file\n    path: a.py\n", 6, require_review=True)
+        self.assertEqual(ctx.exception.reason, "bad_schema")
+
+    def test_parse_response_returns_review(self):
+        review = parse_response(f"```yaml\n{GOOD_REVIEW_YAML}```", 6)
+        self.assertIsInstance(review, ReviewOutput)
+        self.assertEqual(review.score, 88)
+
+
 class LLMChatTests(TestCase):
     def _response(self, content: str, finish_reason: str = "stop", status: int = 200):
         resp = MagicMock(status_code=status)
@@ -533,6 +682,40 @@ class LLMChatTests(TestCase):
         review, model = review_with_fallback(_llm_config(_conf(), fallback=("backup-model",)), "sys", "usr")
         self.assertEqual(model, "backup-model")
         self.assertEqual(review.score, 50)
+
+    @patch("reviewer.services.llm.requests.post")
+    def test_truncated_output_retries_same_model_with_bigger_budget(self, post):
+        """finish_reason=length -> same model once more with doubled max_tokens.
+
+        Switching models would throw away the cached prompt prefix, so the
+        escalation must happen on the primary model first.
+        """
+        post.side_effect = [
+            self._response("partial", finish_reason="length"),
+            self._response("review:\n  score: 60\n"),
+        ]
+        review, model = review_with_fallback(_llm_config(_conf()), "sys", "usr")
+        self.assertEqual(model, "test-model")
+        self.assertEqual(review.score, 60)
+        self.assertEqual(post.call_count, 2)
+        first, second = (call.kwargs["json"]["max_tokens"] for call in post.call_args_list)
+        self.assertEqual((first, second), (4000, 8000))
+        self.assertEqual({call.kwargs["json"]["model"] for call in post.call_args_list}, {"test-model"})
+
+    @patch("reviewer.services.llm.requests.post")
+    def test_truncated_retry_cap_then_next_model(self, post):
+        """At the cap there is no escalation: move on to the fallback model."""
+        cfg = _llm_config(_conf(), fallback=("backup-model",))
+        cfg = LLMConfig(base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
+                        fallback_models=cfg.fallback_models, max_output_tokens=16000)
+        post.side_effect = [
+            self._response("partial", finish_reason="length"),
+            self._response("review:\n  score: 40\n"),
+        ]
+        review, model = review_with_fallback(cfg, "sys", "usr")
+        self.assertEqual(model, "backup-model")
+        budgets = [call.kwargs["json"]["max_tokens"] for call in post.call_args_list]
+        self.assertEqual(budgets, [16000, 16000])  # no 32000 attempt
 
 
 class RenderTests(TestCase):
@@ -802,6 +985,52 @@ class PipelineTests(TestCase):
 
     @patch("reviewer.services.pipeline.review_with_fallback")
     @patch("reviewer.services.pipeline.GitLabClient")
+    def test_need_context_round_fetches_then_reviews(self, client_cls, review_fn):
+        """need_context -> fetch over GitLab API -> second call returns the review."""
+        client = self._client_mock()
+        client.get_file_content.return_value = "def charge():\n    pass\n"
+        client_cls.return_value = client
+        request = ContextRequest.model_validate(
+            {"items": [{"type": "file", "path": "src/gateway.py", "reason": "check retry"}]}
+        )
+        review_fn.side_effect = [(request, "test-model"), (parse_review(GOOD_REVIEW_YAML, 6), "test-model")]
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(review_fn.call_count, 2)
+        # layer-1 enrichment already fetched app.py; exactly one extra fetch
+        # must come from the model's need_context request
+        requested = [c for c in client.get_file_content.call_args_list if c.args[1] == "src/gateway.py"]
+        self.assertEqual(requested, [call("backend/payments", "src/gateway.py", "a" * 40)])
+        ai_step = next(s for s in record.steps if s["step"] == "ai_review")
+        self.assertIn("主动补上下文 1 轮", ai_step["detail"])
+        self.assertIn("+1 文件", ai_step["detail"])
+        self.assertEqual(record.issues_count, 1)
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_context_budget_exhausted_forces_final_review(self, client_cls, review_fn):
+        """Unfetchable request -> one forced final call with the budget note, no loop."""
+        client = self._client_mock()
+        client.get_file_content.return_value = ""  # empty content -> nothing fetchable
+        client_cls.return_value = client
+        request = ContextRequest.model_validate({"items": [{"type": "file", "path": "src/gateway.py"}]})
+        review_fn.side_effect = [(request, "test-model"), (parse_review(GOOD_REVIEW_YAML, 6), "test-model")]
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(review_fn.call_count, 2)
+        forced_call = review_fn.call_args_list[1]
+        self.assertIn("budget is exhausted", forced_call.args[2])  # note appended to the user prompt
+        self.assertTrue(forced_call.kwargs.get("require_review"))
+        self.assertEqual(record.issues_count, 1)
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
     def test_success_flow(self, client_cls, review_fn):
         client = self._client_mock()
         client_cls.return_value = client
@@ -828,6 +1057,50 @@ class PipelineTests(TestCase):
              "ai_review": "success", "publish": "success"},
         )
         self.assertTrue(all(s["detail"] for s in record.steps))  # every stage carries a log line
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_mr_meta_and_full_issues_persisted(self, client_cls, review_fn):
+        """标题/作者/分支与完整问题清单、总结评论快照都要落库（详情页档案）。"""
+        client = self._client_mock()
+        client_cls.return_value = client
+        with patch("reviewer.services.pipeline.get_conf", return_value=_conf(inline_comments=False)):
+            review_fn.return_value = (parse_review(GOOD_REVIEW_YAML, num_max_findings=6), "test-model")
+            from .services.pipeline import run_review
+
+            run_review("backend/payments", 1)
+
+        record = ReviewRecord.objects.get()
+        self.assertEqual(record.mr_title, "Add feature")
+        self.assertEqual(record.author, "alice")
+        self.assertEqual((record.source_branch, record.target_branch), ("feat", "main"))
+        self.assertEqual(len(record.key_issues), 1)
+        self.assertEqual(record.key_issues[0]["issue_header"], "Bug")
+        self.assertIn(REVIEW_MARKER, record.summary_comment)
+        self.assertIn("Bug", record.summary_comment)
+
+    @patch("reviewer.services.pipeline.review_with_fallback")
+    @patch("reviewer.services.pipeline.GitLabClient")
+    def test_false_positive_marks_injected_into_prompt(self, client_cls, review_fn):
+        """同仓库人工标记的误报进入提示词；命中 diff 文件的排在前面。"""
+        IssueFeedback.objects.create(project_path="backend/payments", mr_iid=9,
+                                     relevant_file="other.py", start_line=1,
+                                     issue_header="Old finding", marked_by="zhang")
+        IssueFeedback.objects.create(project_path="backend/payments", mr_iid=9,
+                                     relevant_file="app.py", start_line=2,
+                                     issue_header="Bug", marked_by="zhang")
+        client = self._client_mock()
+        client_cls.return_value = client
+        review_fn.return_value = (parse_review(GOOD_REVIEW_YAML, num_max_findings=6), "test-model")
+        from .services.pipeline import run_review
+
+        run_review("backend/payments", 1)
+
+        user_prompt = review_fn.call_args.args[2]
+        self.assertIn("Human-marked false positives", user_prompt)
+        self.assertIn("`app.py` L2 Bug", user_prompt)
+        self.assertIn("`other.py` L1 Old finding", user_prompt)
+        self.assertLess(user_prompt.index("app.py` L2 Bug"), user_prompt.index("other.py` L1"))
 
     @patch("reviewer.services.pipeline.review_with_fallback")
     @patch("reviewer.services.pipeline.GitLabClient")
@@ -927,7 +1200,7 @@ class PipelineTests(TestCase):
         run_review("backend/payments", 1)
         client.create_inline_discussion.assert_called_once()
         position = client.create_inline_discussion.call_args.args[3]
-        self.assertEqual(position["new_line"], 1)  # 0-based
+        self.assertEqual(position["new_line"], 2)  # 1-based new-file line, same as start_line
         self.assertEqual(position["base_sha"], "b")
         self.assertEqual(position["head_sha"], "h")
         # issue published inline is removed from the summary comment
@@ -1160,6 +1433,12 @@ class ConfDbOverrideTests(TestCase):
             conf = reload_conf()
         self.assertFalse(conf.context_enrichment)
         self.assertEqual((conf.context_max_files, conf.context_max_file_chars, conf.context_max_symbols), (3, 5000, 2))
+
+    def test_context_fetch_rounds_env_db_and_clamp(self):
+        with patch.dict(os.environ, {"GITLABMR_CONTEXT_FETCH_ROUNDS": "9"}):
+            self.assertEqual(reload_conf().context_fetch_rounds, 3)  # code ceiling
+        Setting.objects.create(context_fetch_rounds=0)
+        self.assertEqual(reload_conf().context_fetch_rounds, 0)  # 0 = feature off
 
     def test_db_cannot_exceed_inline_and_findings_ceilings(self):
         Setting.objects.create(inline_max_comments=500, num_max_findings=100)
@@ -1457,19 +1736,106 @@ class DashboardTests(TestCase):
         submit.assert_called_once_with("backend/payments", 7, source="manual", force=True)
 
     def test_detail_shows_non_inline_issues(self):
-        """The detail page lists the review issues that did not go inline."""
+        """Legacy records (no key_issues) still list their summary-only issues."""
         record = self._record(non_inline_issues=[{
             "relevant_file": "app.py", "start_line": 2, "end_line": 2,
             "issue_header": "Bug", "issue_content": "bad thing", "kind": "verified",
             "evidence": "app.py:2 uses x",
         }])
         resp = self.client.get(f"/reviews/{record.pk}/")
-        self.assertContains(resp, "非行内评审意见")
+        self.assertContains(resp, "评审发现")
         self.assertContains(resp, "Bug")
         self.assertContains(resp, "bad thing")
         self.assertContains(resp, "app.py L2-L2")
         self.assertContains(resp, "verified")
         self.assertContains(resp, "app.py:2 uses x")
+        self.assertContains(resp, "总结评论")
+        # deep link into the GitLab diff view at the finding's file
+        # (GitLab anchors diff files by sha1(file_path), see lib/gitlab/diff/file.rb)
+        file_hash = hashlib.sha1(b"app.py").hexdigest()
+        self.assertContains(resp, f"{record.mr_url}/diffs?file={file_hash}#diff-content-{file_hash}")
+        self.assertContains(resp, "标记误报")
+
+    def test_detail_shows_all_issues_with_publish_channel(self):
+        """key_issues lists every finding; summary-only ones are distinguishable."""
+        issues = [
+            {"relevant_file": "app.py", "start_line": 2, "end_line": 2, "issue_header": "Bug",
+             "issue_content": "bad thing", "kind": "verified", "evidence": "app.py:2 uses x"},
+            {"relevant_file": "src/util.py", "start_line": 7, "end_line": 9, "issue_header": "Style",
+             "issue_content": "cleanup", "kind": "suggestion", "evidence": "patch-only"},
+        ]
+        record = self._record(key_issues=issues, non_inline_issues=[issues[1]])
+        resp = self.client.get(f"/reviews/{record.pk}/")
+        self.assertContains(resp, "Bug")
+        self.assertContains(resp, "Style")
+        self.assertContains(resp, "行内评论")
+        self.assertContains(resp, "总结评论")
+        file_hash = hashlib.sha1(b"src/util.py").hexdigest()
+        self.assertContains(resp, f"{record.mr_url}/diffs?file={file_hash}#diff-content-{file_hash}")
+
+    def test_feedback_mark_unmark_roundtrip(self):
+        """误报标记：mark 落库去重，unmark 删除，重复 mark 只留一条。"""
+        record = self._record(key_issues=[{
+            "relevant_file": "app.py", "start_line": 2, "end_line": 2, "issue_header": "Bug",
+            "issue_content": "bad thing", "kind": "verified", "evidence": "",
+        }])
+        url = f"/reviews/{record.pk}/feedback/"
+        payload = {"action": "mark", "file": "app.py", "start_line": "2", "end_line": "2", "header": "Bug"}
+        resp = self.client.post(url, payload)
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+        mark = IssueFeedback.objects.get()
+        self.assertEqual((mark.project_path, mark.mr_iid, mark.relevant_file, mark.start_line), 
+                         ("backend/payments", 7, "app.py", 2))
+        self.assertEqual(mark.marked_by, "tester")
+        self.client.post(url, payload)  # duplicate mark must not create a second row
+        self.assertEqual(IssueFeedback.objects.count(), 1)
+        # detail page shows the marked state and the unmark button
+        page = self.client.get(f"/reviews/{record.pk}/")
+        self.assertContains(page, "已标记误报")
+        self.assertContains(page, "撤销误报标记")
+        # unmark removes it
+        resp = self.client.post(url, {"action": "unmark", "file": "app.py", "start_line": "2",
+                                      "end_line": "2", "header": "Bug"})
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+        self.assertEqual(IssueFeedback.objects.count(), 0)
+
+    def test_feedback_requires_file(self):
+        record = self._record()
+        self.client.post(f"/reviews/{record.pk}/feedback/", {"action": "mark", "file": " "})
+        self.assertEqual(IssueFeedback.objects.count(), 0)
+
+    def test_retry_blocked_while_running(self):
+        record = self._record(status="running")
+        with patch("reviewer.ui.submit_review") as submit:
+            resp = self.client.post(f"/reviews/{record.pk}/retry/")
+        submit.assert_not_called()
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+
+    def test_retry_blocked_while_another_commit_is_running(self):
+        """Retrying an old record must not disturb a newer in-flight review."""
+        record = self._record(status="success", head_sha="a" * 40)
+        self._record(status="running", head_sha="b" * 40)
+        with patch("reviewer.ui.submit_review") as submit:
+            resp = self.client.post(f"/reviews/{record.pk}/retry/")
+        submit.assert_not_called()
+        self.assertRedirects(resp, f"/reviews/{record.pk}/")
+
+    # ---- 首页筛选：状态 / 风险 / 关键词 ----
+
+    def test_dashboard_filters_status_risk_and_search(self):
+        self._record(project_path="backend/payments", mr_iid=1, head_sha="a" * 40,
+                     mr_title="支付回调重构", risk_level="high", status="success")
+        self._record(project_path="frontend/web", mr_iid=2, head_sha="b" * 40,
+                     mr_title="首页样式调整", risk_level="low", status="failed")
+        self.assertEqual(len(self.client.get("/?status=failed").context["reviews"]), 1)
+        self.assertEqual(len(self.client.get("/?risk=high").context["reviews"]), 1)
+        self.assertEqual(len(self.client.get("/?q=支付").context["reviews"]), 1)
+        self.assertEqual(self.client.get("/?q=支付").context["reviews"][0].project_path, "backend/payments")
+        self.assertEqual(len(self.client.get("/?q=frontend").context["reviews"]), 1)
+        self.assertEqual(len(self.client.get("/?q=9999").context["reviews"]), 0)
+        # filters survive pagination links
+        page = self.client.get("/?status=failed&q=x")
+        self.assertEqual(page.context["url_params"], "status=failed&q=x")
 
     def test_detail_shows_skip_reason(self):
         record = self._record(status="skipped", error_detail="no reviewable files")
