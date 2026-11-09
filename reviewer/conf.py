@@ -3,7 +3,7 @@
 Config sources, in priority order:
 1. ``GITLABMR_REPO_CONFIG``  - path to a YAML/JSON file describing per-repo tokens (match by URL prefix).
 2. ``GITLABMR_REPO_TOKENS``  - the same structure inlined as JSON in an env var.
-Plus plain env vars for the AI endpoint, webhook secret and tuning knobs (see README).
+Plus plain env vars for the AI endpoint, GitLab address/tokens and tuning knobs (see README).
 """
 
 from __future__ import annotations
@@ -121,12 +121,10 @@ class RepoToken:
     product: str = ""
     api_url: str = ""
     token: str = ""
-    webhook_secret: str | None = None
 
 
 @dataclass(frozen=True)
 class Conf:
-    webhook_secret: str
     default_api_url: str
     default_token: str
     repo_tokens: tuple[RepoToken, ...] = field(default=())
@@ -180,7 +178,6 @@ def _parse_repo_entries(entries: list) -> tuple[RepoToken, ...]:
                 product=product,
                 api_url=api_origin(entry.get("api_url", "")) or match_url_origin(match_url),
                 token=token,
-                webhook_secret=(str(entry["webhook_secret"]).strip() if entry.get("webhook_secret") else None),
             )
         )
     # Longest URL first so resolution is a simple linear scan.
@@ -202,7 +199,6 @@ def _load_repo_tokens() -> tuple[RepoToken, ...]:
 
 def _load_env_conf() -> Conf:
     return Conf(
-        webhook_secret=_env("GITLABMR_WEBHOOK_SECRET"),
         default_api_url=api_origin(_env("GITLABMR_GITLAB_URL", "https://gitlab.com")),
         default_token=_env("GITLABMR_GITLAB_TOKEN"),
         repo_tokens=_load_repo_tokens(),
@@ -232,9 +228,6 @@ def _load_env_conf() -> Conf:
 
 
 _TEXT_OVERRIDES = (
-    "webhook_secret",
-    "default_api_url",
-    "default_token",
     "llm_base_url",
     "llm_api_key",
     "model",
@@ -287,12 +280,6 @@ def _apply_db_overrides(conf: Conf) -> Conf:
             if value is not None:
                 updates[name] = value
 
-    # The dashboard stores whatever the admin typed; the same project-page-URL
-    # trap applies to the default address (see api_origin) - normalize before
-    # anything consumes it, including the per-entry fallback below.
-    if updates.get("default_api_url"):
-        updates["default_api_url"] = api_origin(updates["default_api_url"])
-
     if token_entries:
         db_tokens = []
         for entry in token_entries:
@@ -306,7 +293,6 @@ def _apply_db_overrides(conf: Conf) -> Conf:
                     product=(entry.product or "").strip(),
                     api_url=match_url_origin(match_url),
                     token=entry.token,
-                    webhook_secret=entry.webhook_secret or None,
                 )
             )
         # Longest URL first so resolution is a simple linear scan.

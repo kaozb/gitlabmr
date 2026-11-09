@@ -59,9 +59,9 @@ GitLab ──webhook──▶ Django view (POST /tech_powered/code_review/)
 
 | 模块 | 职责 | 对应 PR-Agent 概念 |
 |---|---|---|
-| `views.py` | webhook 入口：验签、过滤、幂等、投递 | `servers/gitlab_webhook.py` |
+| `views.py` | webhook 入口：过滤、幂等、投递 | `servers/gitlab_webhook.py` |
 | `conf.py` | 环境变量/配置文件加载：仓库令牌表（URL 前缀匹配）、AI 参数 | Dynaconf settings |
-| `services/tokens.py` | GitLab URL 前缀→（api_url, token, webhook_secret）解析，最长地址优先 | 请求级 settings 隔离 |
+| `services/tokens.py` | GitLab URL 前缀→（api_url, token）解析，最长地址优先 | 请求级 settings 隔离 |
 | `services/gitlab.py` | 薄封装 REST API v4：MR/changes/notes/discussions/user | `gitlab_provider.py` |
 | `services/diffctx.py` | 变更过滤、hunk 行号化、token 预算裁剪、清单 | `pr_processing.py` + `git_patch_processing.py` |
 | `services/prompts.py` | system/user prompt、YAML schema 说明 | `pr_reviewer_prompts.toml` |
@@ -86,7 +86,6 @@ repos:
   - match_url: https://gitlab.internal/tp/CNEOSv2   # 匹配依据：GitLab URL 前缀，最长者生效
     product: CNEOSv2        # 仅作展示标签，与匹配无关
     token: glpat-cneosv2
-    webhook_secret: whsec-b1    # 可选，未配置则用全局 GITLABMR_WEBHOOK_SECRET
   - match_url: https://gitlab.internal/tp
     token: glpat-tp
 ```
@@ -98,7 +97,7 @@ repos:
 
 ### D2 Webhook 安全与幂等
 
-- `X-Gitlab-Token` 与密钥用 `hmac.compare_digest` 比较；支持全局密钥 + 每前缀密钥覆盖。
+- 不做共享密钥验签（原全局/每仓库 secret 配置已连同控制台「GitLab 连接」设置一起移除）：端点面向可信内网，未匹配到令牌的项目在解析阶段直接忽略。
 - 过滤链：`object_kind != merge_request` 直接 200 忽略；bot 用户（`user.username` 匹配指示词，如 bot）跳过；draft/WIP 跳过（防自触发死循环）；`ignore_branches` 可配。
 - 幂等：`ReviewRecord` 上 `UniqueConstraint(project_path, mr_iid, head_sha)` —— 同一提交不重评；同 MR 并发事件由唯一约束 + 进行中状态检查挡住（R1-2 修订）。
 
@@ -146,7 +145,8 @@ repos:
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DJANGO_SECRET_KEY` | 必填 | Django 密钥 |
-| `GITLABMR_WEBHOOK_SECRET` | 必填 | webhook 全局验签令牌 |
+| `GITLABMR_GITLAB_URL` | `https://gitlab.com` | 默认 GitLab 地址（与默认令牌一起参与匹配） |
+| `GITLABMR_GITLAB_TOKEN` | 空 | 默认访问令牌（无 API 地址命中时兜底；留空则未知仓库被忽略） |
 | `GITLABMR_REPO_CONFIG` / `GITLABMR_REPO_TOKENS` | 必填其一 | 仓库前缀令牌表（YAML 文件路径 / JSON 字符串） |
 | `GITLABMR_LLM_BASE_URL` | 必填 | OpenAI 兼容端点，如 `https://api.deepseek.com/v1` |
 | `GITLABMR_LLM_API_KEY` | 必填 | 模型密钥 |
@@ -169,7 +169,7 @@ repos:
   - tokens：长前缀优先（非段感知，`tp/cneos` 覆盖 `tp/CNEOSv2/...`）/ 前缀写法与大小写归一化（`tp` = `tp/` = `TP`）/ 默认兜底 / 无令牌 skip；
   - diffctx：hunk 行号化正确性、过滤、两级裁剪、清单生成；
   - llm：yaml 栅栏剥离、坏 key 修复、schema 校验失败触发回退、finish_reason=length 触发回退；
-  - views：验签失败 403、bot/draft 过滤、幂等（同 sha 二次投递不重评）、投递成功 200；
+  - views：bot/draft 过滤、幂等（同 sha 二次投递不重评）、投递成功 200；
   - publisher：持久化评论"找到即更新/作者不符另发/无则新建"，行内 position 的 0-based 与三 sha 正确性。
 - 冒烟：`manage.py runserver` + `curl` 带样例 payload → 观察 `WebhookEvent/ReviewRecord` 状态流转。
 

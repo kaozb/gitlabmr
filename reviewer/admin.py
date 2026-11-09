@@ -24,13 +24,13 @@ class ReviewRecordAdmin(admin.ModelAdmin):
 
 @admin.register(RepoTokenEntry)
 class RepoTokenEntryAdmin(admin.ModelAdmin):
-    list_display = ("product", "api_url", "token", "webhook_secret", "enabled", "note", "updated_at")
+    list_display = ("product", "api_url", "token", "enabled", "note", "updated_at")
     search_fields = ("product", "api_url", "note")
 
 
 @admin.register(Setting)
 class SettingAdmin(admin.ModelAdmin):
-    list_display = ("id", "model", "llm_base_url", "default_api_url", "updated_at")
+    list_display = ("id", "model", "llm_base_url", "updated_at")
     readonly_fields = [f.name for f in Setting._meta.fields]
 
     def has_add_permission(self, request):

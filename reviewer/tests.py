@@ -55,7 +55,6 @@ def _llm_config(conf: Conf, fallback: tuple[str, ...] = ()) -> LLMConfig:
 
 def _conf(**overrides) -> Conf:
     base = dict(
-        webhook_secret="whsec",
         default_api_url="https://gitlab.example.com",
         default_token="default-token",
         repo_tokens=(
@@ -138,13 +137,12 @@ class ApiOriginTests(TestCase):
             "https://gl.example.com/api/v4/projects/WAF%2Fnextwaf%2Fweb_ui/merge_requests/3114",
         )
 
-    def test_config_layers_normalize_repo_and_default_urls(self):
+    def test_config_layers_normalize_repo_urls(self):
         entry = RepoTokenEntry.objects.create(
             product="WAF", token="glpat-1", api_url="https://gl.example.com/WAF"
         )
-        Setting.objects.create(default_api_url="https://gl.example.com/WAF")
-        conf = reload_conf()
-        self.assertEqual(conf.default_api_url, "https://gl.example.com")
+        with patch.dict(os.environ, {"GITLABMR_GITLAB_URL": "https://gl.example.com"}):
+            conf = reload_conf()
         repo = resolve_repo_token(conf, "WAF/nextwaf/web_ui")
         self.assertEqual(repo.match_url, "https://gl.example.com/waf")
         self.assertEqual(repo.api_url, "https://gl.example.com")
@@ -641,12 +639,13 @@ class WebhookViewTests(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertNotIn("Location", resp.headers)
 
-    def test_bad_token_rejected(self):
+    def test_bad_token_ignored_no_verification(self):
+        # 验签配置（全局/每仓库 secret）已随「GitLab 连接」设置一并移除：端点不做验签
         resp = self._post({"object_kind": "push"}, token="wrong")
-        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.status_code, 200)
 
     def test_no_secret_configured_accepts_unverified(self):
-        conf = _conf(webhook_secret="", repo_tokens=())
+        conf = _conf(repo_tokens=())
         with patch("reviewer.views.get_conf", return_value=conf), patch("reviewer.views.submit_review") as submit:
             resp = self._post(self._mr_payload(project="any/repo"))
         self.assertEqual(resp.status_code, 200)
@@ -720,15 +719,14 @@ class WebhookViewTests(TestCase):
 
     def test_per_repo_secret_accepted(self):
         conf = _conf(repo_tokens=(
-            RepoToken(match_url="https://gitlab.example.com/backend", api_url="https://x", token="t",
-                      webhook_secret="repo-secret"),
+            RepoToken(match_url="https://gitlab.example.com/backend", api_url="https://x", token="t"),
         ))
         with patch("reviewer.views.get_conf", return_value=conf), patch("reviewer.views.submit_review"):
             resp = self.client.post(
                 "/tech_powered/code_review/",
                 data=json.dumps(self._mr_payload()),
                 content_type="application/json",
-                HTTP_X_GITLAB_TOKEN="repo-secret",
+                HTTP_X_GITLAB_TOKEN="whsec",
             )
         self.assertEqual(resp.status_code, 200)
 
@@ -1120,8 +1118,8 @@ class ConfDbOverrideTests(TestCase):
             self.assertTrue(reload_conf().review_on_push)
 
     def test_db_repo_tokens_replace_env_ones(self):
-        Setting.objects.create(default_api_url="https://db.example.com")
-        env = {"GITLABMR_GITLAB_TOKEN": "", "GITLABMR_WEBHOOK_SECRET": "",
+        # 无 host 的纯路径匹配以默认 GitLab 地址为基准（env 配置）
+        env = {"GITLABMR_GITLAB_URL": "https://db.example.com", "GITLABMR_GITLAB_TOKEN": "",
                "GITLABMR_REPO_CONFIG": "", "GITLABMR_REPO_TOKENS": ""}
         with patch.dict(os.environ, env):
             reload_conf()
@@ -1490,10 +1488,10 @@ class DashboardTests(TestCase):
 class SettingsViewTests(TestCase):
     def setUp(self):
         patcher = patch.dict(os.environ, {"GITLABMR_UI_PASSWORD": "", "GITLABMR_MODEL": "env-model",
-                                          "GITLABMR_LLM_API_KEY": "env-key", "GITLABMR_WEBHOOK_SECRET": ""})
+                                          "GITLABMR_LLM_API_KEY": "env-key",
+                                          "GITLABMR_GITLAB_URL": "https://gitlab.example.com"})
         patcher.start()
         self.addCleanup(patcher.stop)
-        Setting.objects.create(default_api_url="https://gitlab.example.com")
         session = self.client.session
         session["ui_authed"] = True
         session["wework_userid"] = "tester"
@@ -1515,14 +1513,12 @@ class SettingsViewTests(TestCase):
             "workers": "not-a-number",
         })
         self.assertRedirects(resp, "/settings/llm/")
-        self.client.post("/settings/repos/", {"action": "save_settings", "webhook_secret": "whsec-new"})
         conf = reload_conf()
         self.assertEqual(conf.model, "db-model")
         self.assertEqual(conf.num_max_findings, 4)
         self.assertTrue(conf.inline_comments)
         self.assertTrue(conf.review_on_push)  # inherit -> env default true
         self.assertEqual(conf.llm_api_key, "env-key")  # secret blank = keep
-        self.assertEqual(conf.webhook_secret, "whsec-new")
         self.assertNotEqual(conf.workers, "not-a-number")
 
     def test_second_save_updates_same_row(self):
@@ -1568,7 +1564,7 @@ class SettingsViewTests(TestCase):
     def test_repo_token_add_update_delete(self):
         resp = self.client.post("/settings/repos/", {
             "action": "save_repo", "product": "Team", "token": "glpat-1",
-            "api_url": "https://gitlab.example.com/backend/team/", "webhook_secret": "", "note": "team repo",
+            "api_url": "https://gitlab.example.com/backend/team/", "note": "team repo",
             "enabled": "on",
         })
         self.assertRedirects(resp, "/settings/repos/")
@@ -1607,20 +1603,19 @@ class SettingsViewTests(TestCase):
         self.assertEqual(RepoTokenEntry.objects.count(), 1)
 
     def test_repo_token_edit_by_id(self):
-        Setting.objects.update(default_api_url="https://a.example.com")  # setUp 已建行
         entry = RepoTokenEntry.objects.create(
-            product="Team", token="glpat-1", api_url="https://a.example.com/backend/team"
+            product="Team", token="glpat-1", api_url="https://gitlab.example.com/backend/team"
         )
         # 编辑态按主键更新：改产品名/匹配地址都允许，令牌留空保持不变
         resp = self.client.post("/settings/repos/", {
             "action": "save_repo", "entry_id": str(entry.pk), "product": "Team-A",
-            "token": "", "api_url": "https://a.example.com/backend/team-a", "enabled": "on",
+            "token": "", "api_url": "https://gitlab.example.com/backend/team-a", "enabled": "on",
         })
         self.assertRedirects(resp, "/settings/repos/")
         self.assertEqual(RepoTokenEntry.objects.count(), 1)
         entry.refresh_from_db()
         self.assertEqual((entry.product, entry.token), ("Team-A", "glpat-1"))
-        self.assertEqual(entry.api_url, "https://a.example.com/backend/team-a")
+        self.assertEqual(entry.api_url, "https://gitlab.example.com/backend/team-a")
         conf = reload_conf()
         self.assertEqual(resolve_repo_token(conf, "backend/team-a/svc").token, "glpat-1")
         self.assertIsNone(resolve_repo_token(conf, "backend/team/svc"))

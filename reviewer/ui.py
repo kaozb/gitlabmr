@@ -3,7 +3,7 @@
 Pages:
 - ``/``                overview: stats, review records, webhook events, manual trigger
 - ``/settings/llm/``   LLM + review-behavior settings (saved to DB, wins over env)
-- ``/settings/repos/`` GitLab connection defaults + per-repo product tokens
+- ``/settings/repos/`` Per-repo product tokens
   (probe validity, one-click disable of tokens rejected by GitLab)
 - ``/reviews/<pk>/``          one review attempt in full detail (pipeline flowchart)
 - ``/reviews/<pk>/retry/``    force re-run of that review
@@ -34,7 +34,7 @@ from .services.tokens import resolve_repo_token
 
 PROBE_RESULTS_KEY = "repo_token_probe"  # session key: last token-probe outcome
 
-SECRET_FIELDS = ("webhook_secret", "default_token", "llm_api_key")
+SECRET_FIELDS = ("llm_api_key",)
 BOOL_FIELDS = ("inline_comments", "review_on_push")
 INT_FIELDS = (
     "llm_max_output_tokens",
@@ -72,16 +72,13 @@ LLM_SETTING_GROUPS = [
     )),
 ]
 
-REPO_SETTING_GROUPS = [
-    ("GitLab 连接", "webhook 地址、全局验签密钥、默认令牌", (
-        ("webhook_secret", "Webhook 验签密钥", "text",
-         "GitLab Webhook 的 Secret token，各仓库也可在下方单独配置；留空 = 不验签（仅建议内网）"),
-        ("default_api_url", "默认 GitLab 地址", "text", "如 https://gitlab.com；也作为默认令牌的匹配地址"),
-        ("default_token", "默认访问令牌", "password", "没有 API 地址命中时兜底；留空则未知仓库将被忽略"),
-    )),
-]
+# The dashboard-side GitLab connection settings (global webhook secret, default
+# GitLab address, default token) were removed together with the Setting model
+# columns - configure them via env vars (see .env.example / README) instead.
+# Kept as an empty list so ``save_settings`` stays a harmless no-op.
+REPO_SETTING_GROUPS: list = []
 
-REPO_FORM_FIELDS = ("product", "api_url", "token", "webhook_secret", "note")
+REPO_FORM_FIELDS = ("product", "api_url", "token", "note")
 
 
 def ui_password() -> str:
@@ -180,10 +177,8 @@ def dashboard(request):
     }
     summary = [
         ("LLM", f"{conf.llm_base_url or '未配置'} · {conf.model}", bool(conf.llm_base_url and conf.llm_api_key)),
-        ("默认 GitLab", conf.default_api_url, bool(conf.default_token or conf.repo_tokens)),
         ("仓库令牌", (f"数据库 {db_tokens} 条" if db_tokens else f"环境/文件 {len(conf.repo_tokens)} 条"),
          bool(conf.repo_tokens)),
-        ("Webhook 密钥", "已配置" if conf.webhook_secret else "未配置", bool(conf.webhook_secret)),
         ("行内评论", "开" if conf.inline_comments else "关", True),
         ("推送触发", "开" if conf.review_on_push else "关", True),
     ]
@@ -531,7 +526,7 @@ def settings_repos_view(request):
             return redirect("reviewer:settings-repos")
         _apply_setting_post(request.POST, setting or Setting(), REPO_SETTING_GROUPS)
         reload_conf()
-        messages.success(request, "GitLab 连接设置已保存并立即生效")
+        messages.success(request, "设置已保存并立即生效")
         return redirect("reviewer:settings-repos")
 
     edit_url = normalize_match_url(request.GET.get("edit"))
@@ -584,7 +579,6 @@ def _save_repo_token(request):
         return redirect("reviewer:settings-repos")
     fields = {
         "product": product,
-        "webhook_secret": (request.POST.get("webhook_secret") or "").strip(),
         "note": (request.POST.get("note") or "").strip(),
         "enabled": request.POST.get("enabled") == "on",
     }

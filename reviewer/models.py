@@ -81,12 +81,13 @@ class Setting(models.Model):
 
     Blank string / NULL means "inherit from environment defaults"; any value
     stored here wins over env vars (single row, accessed via objects.first()).
+
+    GitLab connection settings (global webhook secret, default GitLab address,
+    default token) were removed from here - they are env-only knobs now, so
+    they can no longer be stored per deployment and forgotten. Repo tokens on
+    the dashboard carry their own match URLs instead.
     """
 
-    # GitLab connection
-    webhook_secret = models.CharField(max_length=256, blank=True, default="")
-    default_api_url = models.CharField(max_length=256, blank=True, default="")
-    default_token = models.CharField(max_length=256, blank=True, default="")
     # AI model
     llm_base_url = models.CharField(max_length=256, blank=True, default="")
     llm_api_key = models.CharField(max_length=256, blank=True, default="")
@@ -130,7 +131,6 @@ class RepoTokenEntry(models.Model):
     # Match key + API origin: the longest entry whose URL covers the project wins.
     api_url = models.CharField(max_length=256, unique=True)
     token = models.CharField(max_length=256)
-    webhook_secret = models.CharField(max_length=256, blank=True, default="")
     enabled = models.BooleanField(default=True)
     note = models.CharField(max_length=256, blank=True, default="")
     updated_at = models.DateTimeField(auto_now=True)

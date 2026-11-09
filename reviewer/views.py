@@ -1,18 +1,16 @@
 """GitLab webhook endpoint.
 
-Contract: authenticate fast, filter cheaply, hand real work to the pipeline's
-thread pool, and always answer 200 quickly (GitLab retries slow webhooks,
-which would cause duplicate reviews).
+Contract: filter cheaply, hand real work to the pipeline's thread pool, and
+always answer 200 quickly (GitLab retries slow webhooks, which would cause
+duplicate reviews).
 
-Auth: the ``X-Gitlab-Token`` header must match the global secret OR the
-matched repo entry's own ``webhook_secret`` (per-repo GitLab webhooks carry
-their own token). With no secret configured at all, requests are accepted
-without verification - intended for trusted intranets only.
+No shared-secret verification: the endpoint is meant for trusted intranets
+(the former webhook-secret configuration was removed together with its
+dashboard UI). Unknown projects are dropped during token resolution anyway.
 """
 
 from __future__ import annotations
 
-import hmac
 import json
 import logging
 
@@ -28,12 +26,6 @@ from .services.tokens import resolve_repo_token
 logger = logging.getLogger("gitlabmr.webhook")
 
 DRAFT_PREFIXES = ("draft:", "wip:", "[draft]", "[wip]")
-
-
-def _token_ok(received: str, expected: str | None) -> bool:
-    if not expected:
-        return False
-    return hmac.compare_digest(received.encode("utf-8"), str(expected).encode("utf-8"))
 
 
 def _is_bot(username: str, indicators: tuple[str, ...]) -> bool:
@@ -63,7 +55,6 @@ def _hostname(url: str) -> str:
 @csrf_exempt
 def gitlab_webhook(request):
     conf = get_conf()
-    received_token = request.headers.get("X-Gitlab-Token", "")
     try:
         data = json.loads(request.body or b"{}")
     except json.JSONDecodeError:
@@ -76,15 +67,6 @@ def gitlab_webhook(request):
     # event belongs to - never the configured default address, which may be a
     # placeholder when every entry carries its full match URL.
     host = _hostname(project.get("web_url", ""))
-    repo = resolve_repo_token(conf, project_path, host) if project_path else None
-
-    configured = conf.webhook_secret or (repo.webhook_secret if repo is not None else None)
-    if configured is None:
-        logger.warning("webhook secret not configured; accepting %s without verification (intranet only)", kind)
-    elif not _token_ok(received_token, conf.webhook_secret) and not (
-        repo is not None and _token_ok(received_token, repo.webhook_secret)
-    ):
-        return JsonResponse({"message": "unauthorized"}, status=403)
 
     event = WebhookEvent(object_kind=kind[:32], project_path=project_path)
     event.host = host  # request-scoped, never persisted

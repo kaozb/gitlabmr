@@ -5,9 +5,10 @@
 <p class="sub">模型接口与评审行为，保存在数据库中并<strong>立即生效</strong>（无需重启）；文本/数字留空表示沿用环境变量默认值，密钥留空表示保持不变。</p>
 {% else %}
 <h1>仓库令牌</h1>
-<p class="sub">GitLab 连接与多仓库令牌，保存在数据库中并<strong>立即生效</strong>；密钥留空表示保持不变。每条配置的 <strong>API 地址</strong>是一个 GitLab URL 前缀（如 https://gitlab.example.com/tp/CNEOSv2/Engine/epi-5.），所有启用条目构成一个集合逐个匹配目标仓库，能命中的里面<strong>地址最长者生效</strong>。</p>
+<p class="sub">多仓库令牌保存在数据库中并<strong>立即生效</strong>；令牌留空表示保持不变。每条配置的 <strong>API 地址</strong>是一个 GitLab URL 前缀（如 https://gitlab.example.com/tp/CNEOSv2/Engine/epi-5.），所有启用条目构成一个集合逐个匹配目标仓库，能命中的里面<strong>地址最长者生效</strong>。</p>
 {% endif %}
 
+{% if groups %}
 <div class="card">
   <form method="post">
     {% csrf_token %}
@@ -40,6 +41,7 @@
     <div style="margin-top:20px"><button class="btn primary" type="submit">保存设置</button></div>
   </form>
 </div>
+{% endif %}
 
 {% if show_repos %}
 <div class="card">
@@ -63,14 +65,13 @@
 
   {% if repo_entries %}
   <table>
-    <thead><tr><th>产品</th><th>API 地址（匹配依据，最长者优先）</th><th>令牌</th><th>Webhook 密钥</th><th>启用</th><th>备注</th><th>操作</th></tr></thead>
+    <thead><tr><th>产品</th><th>API 地址（匹配依据，最长者优先）</th><th>令牌</th><th>启用</th><th>备注</th><th>操作</th></tr></thead>
     <tbody>
       {% for entry in repo_entries %}
       <tr{% if entry.is_dead %} class="row-dead"{% endif %}>
         <td>{{ entry.product|default:"—" }}</td>
         <td class="mono">{{ entry.api_url }}</td>
         <td class="mono">{{ entry.masked_token }}</td>
-        <td class="mono">{% if entry.webhook_secret %}已配置{% else %}—{% endif %}</td>
         <td>{% if entry.enabled %}<span class="pill-yes">开</span>{% else %}<span class="pill-no">关</span>{% endif %}</td>
         <td class="muted">{{ entry.note|default:"—" }}</td>
         <td>
@@ -112,10 +113,6 @@
           <label>访问令牌 {% if editing %}（留空保持不变）{% else %}*{% endif %}</label>
           <input type="password" name="token" value="" autocomplete="new-password"
                  placeholder="{% if editing %}已配置，留空保持不变{% else %}glpat-xxxx{% endif %}">
-        </div>
-        <div>
-          <label>Webhook 密钥（可选）</label>
-          <input type="text" name="webhook_secret" value="{{ editing.webhook_secret|default:'' }}" placeholder="该仓库 webhook 的独立 Secret token">
         </div>
         <div>
           <label>备注（可选）</label>
